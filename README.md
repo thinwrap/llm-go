@@ -1,7 +1,5 @@
 # thinwrap/llm (Go)
 
-> ⚠️ **Work in progress (v0).** A faithful Go port of [`@thinwrap/llm`](https://github.com/thinwrap/llm-ts) (TypeScript) and [`thinwrap/llm`](https://github.com/thinwrap/llm-php) (PHP): one unified `Chat` + `Embeddings` surface over **18 providers**, with the same normalized shapes and error model.
-
 Unified, **SDK-free**, **zero-dependency** Go wrapper for **chat completions**
 (with streaming) and **embeddings** across 18 LLM providers. Switch vendor by
 changing the provider id + model; the input and output shapes stay identical.
