@@ -1,0 +1,84 @@
+name: Release (Go module)
+
+# Go has no package registry to push to — the public module proxy serves the
+# module directly from the git tag. This workflow therefore does NOT publish a
+# package; on a `v*.*.*` tag it (1) re-runs the gofmt/vet/build/test gates
+# against the tagged commit, (2) cuts a GitHub Release with generated notes,
+# and (3) warms the public module proxy so `go get` and pkg.go.dev see the
+# version immediately.
+#
+# Consumers: go get github.com/thinwrap/llm-go@vX.Y.Z
+#
+# No registry account, no OIDC token, no bootstrap. The tag IS the release;
+# everything here is gate + convenience.
+#
+# Trigger: push of a `v*.*.*` tag (branch protection on `main` ensures the
+# tag's commit is on a protected branch).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write       # required to create the GitHub Release
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: gate + release github.com/thinwrap/llm-go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test + coverage gate (>=80%)
+        run: |
+          go test -covermode=count -coverprofile=coverage.out ./...
+          pct=$(go tool cover -func=coverage.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "total coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 80 ? 0 : 1) }' \
+            || { echo "coverage ${pct}% is below the 80% gate"; exit 1; }
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; skipping."
+          else
+            gh release create "$tag" --title "$tag" --generate-notes --verify-tag
+          fi
+
+      - name: Warm the Go module proxy
+        # Fetching the version's .info from proxy.golang.org registers the tag
+        # on the public proxy + checksum DB and triggers pkg.go.dev indexing.
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          mod="github.com/thinwrap/llm-go"
+          for i in 1 2 3; do
+            if curl -fsSL "https://proxy.golang.org/${mod}/@v/${tag}.info"; then
+              echo; echo "proxy warmed for ${mod}@${tag}"; break
+            fi
+            echo "proxy not ready yet (attempt $i), retrying in 10s..."; sleep 10
+          done
