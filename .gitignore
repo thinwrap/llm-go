@@ -1,0 +1,8 @@
+# Test / coverage artifacts
+*.out
+coverage.txt
+
+# Editor / OS
+.DS_Store
+.idea/
+*.swp
