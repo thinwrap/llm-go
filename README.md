@@ -109,6 +109,16 @@ One of four thinwrap llm libraries sharing a normalized surface and byte-identic
 provider ids / error codes: TypeScript (`@thinwrap/llm`), PHP (`thinwrap/llm`),
 Go (this package), Python (`thinwrap-llm`).
 
+## Security
+
+Report vulnerabilities **privately** — please do not open a public issue. Preferred: a
+[private security advisory](https://github.com/thinwrap/llm-go/security/advisories/new)
+on this repository. Alternatively, email **security@thinwrap.dev**. Include the affected
+versions and a minimal reproduction if you have one.
+
+A vulnerability in a *provider's* own API or service belongs to that vendor rather than
+to this wrapper — please report those upstream.
+
 ## License
 
 MIT © Dmitry Polyanovsky & contributors
