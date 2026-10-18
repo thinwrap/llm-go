@@ -1,10 +1,12 @@
 package llm
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"testing"
 )
 
 type recordedRequest struct {
@@ -64,4 +66,32 @@ func sseResp(body string) *http.Response {
 	r := resp(200, body)
 	r.Header.Set("Content-Type", "text/event-stream")
 	return r
+}
+
+// drain reads a stream to io.EOF and returns every delta; any other error fails
+// the test.
+func drain(t *testing.T, s *ChatStream) []*ChatStreamDelta {
+	t.Helper()
+	defer s.Close()
+	var out []*ChatStreamDelta
+	for {
+		d, err := s.Recv()
+		if err == io.EOF {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("stream: %v", err)
+		}
+		out = append(out, d)
+	}
+}
+
+// sentBody decodes the JSON body of the last recorded request.
+func sentBody(t *testing.T, f *fakeClient) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(f.last().Body), &m); err != nil {
+		t.Fatalf("request body not JSON: %v", err)
+	}
+	return m
 }

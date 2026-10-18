@@ -43,7 +43,9 @@ Get the key + resource endpoint from the Azure portal. The connector sends it as
 
 - **`BaseURL` is required** (no fixed public default).
 - `Model` is the per-resource **deployment name**, not a portable global model id.
-- `MaxOutputTokens` maps to `max_tokens`. `Reasoning.Effort` maps to `reasoning_effort`.
+- `MaxOutputTokens` maps to `max_completion_tokens` (Azure reasoning models accept only `max_completion_tokens` on Chat Completions). `Reasoning.Effort` maps to `reasoning_effort`.
+- `max_completion_tokens` exists from api-version `2024-09-01-preview` (preview) and `2024-10-21` (GA) and in the v1 API; older api-versions (`2024-06-01`, `2024-08-01-preview` and before) do not define it, so a `BaseURL` / `Passthrough.Query` pinned to one of those should leave `MaxOutputTokens` unset and send `max_tokens` via `Passthrough.Body`.
+- **Function tools with reasoning (Chat Completions):** current deployments (gpt-5.4, gpt-5.4-mini, gpt-5.5, the gpt-5.6 family) reject `Tools` combined with reasoning with a 400, which passes through as `invalid_request`; gpt-5.6 does so even with `Reasoning` unset, because it reasons by default. To call tools on Chat Completions, send `Passthrough.Body["reasoning_effort"] = "none"` (accepted on gpt-5.4 and later; gpt-5-mini and o4-mini reject `"none"`). Moving this connector to the Responses API, which combines both, is planned.
 - Streaming via `chat.Stream(ctx, in)` → `Recv()` until `io.EOF`, then `Close()`. `stream_options.include_usage` is set.
 
 ## Embeddings

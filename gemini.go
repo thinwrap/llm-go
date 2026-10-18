@@ -13,9 +13,10 @@ import (
 
 // Native adapter for the Google Gemini (AI Studio) generateContent API. Gemini
 // uses contents[]/parts[] (roles user/model), a top-level systemInstruction,
-// functionDeclarations, and keys tool results by function NAME (not id). This
-// connector translates the normalized surface to that shape and back, emitting
-// the identical ChatResult/ChatStreamDelta/ConnectorError. Unlike Bedrock,
+// functionDeclarations, and keys tool results by function NAME (an id is
+// optional and often absent). This connector translates the normalized surface
+// to that shape and back, emitting the identical
+// ChatResult/ChatStreamDelta/ConnectorError. Unlike Bedrock,
 // Gemini streaming IS SSE (:streamGenerateContent?alt=sse), so streaming is
 // truly incremental.
 
@@ -54,11 +55,17 @@ func (c *geminiConnector) complete(ctx context.Context, in ChatInput) (*ChatResu
 	if err != nil {
 		return nil, err
 	}
-	raw := decodeAny(readBody(resp))
+	raw, readErr := readJSON(resp)
 	if !okStatus(resp.StatusCode) {
 		return nil, geminiVendorError(resp, raw)
 	}
-	if raw == nil {
+	if readErr != nil {
+		return nil, transportError(readErr)
+	}
+	// A prompt-level safety block legitimately omits candidates (parseResult
+	// surfaces it as content_filter); any other body without a candidates array
+	// is not a completion.
+	if _, ok := jsonSliceVal(jsonGet(raw, "candidates")); !ok && jsonStr(jsonGet(jsonGet(raw, "promptFeedback"), "blockReason")) == "" {
 		return nil, emptyBodyError(resp.StatusCode)
 	}
 	return c.parseResult(raw, in.Model), nil
@@ -76,14 +83,18 @@ func (c *geminiConnector) stream(ctx context.Context, in ChatInput) (*ChatStream
 		return nil, err
 	}
 	if !okStatus(resp.StatusCode) {
-		raw := decodeAny(readBody(resp))
+		raw, _ := readJSON(resp)
 		return nil, geminiVendorError(resp, raw)
 	}
-	sawFunctionCall := false
-	toolIndex := 0
+	if err := requireEventStream(resp); err != nil {
+		return nil, err
+	}
+	st := &geminiStreamState{status: resp.StatusCode}
+	// The terminal event is a chunk with a finishReason (or a promptFeedback
+	// block); both surface as a finish delta.
 	return newChatStream(resp, func(chunk any) ([]*ChatStreamDelta, error) {
-		return c.mapStreamChunk(chunk, &sawFunctionCall, &toolIndex)
-	}), nil
+		return c.mapStreamChunk(chunk, st)
+	}, nil), nil
 }
 
 func (c *geminiConnector) authHeaders(in ChatInput) map[string]string {
@@ -115,7 +126,9 @@ func (c *geminiConnector) buildRequest(in ChatInput) map[string]any {
 				fn["description"] = t.Description
 			}
 			if t.Parameters != nil {
-				fn["parameters"] = t.Parameters
+				// parametersJsonSchema takes standard JSON Schema; `parameters`
+				// is an OpenAPI subset that rejects additionalProperties, $ref, ….
+				fn["parametersJsonSchema"] = t.Parameters
 			}
 			decls = append(decls, fn)
 		}
@@ -166,17 +179,7 @@ func (c *geminiConnector) parseResult(raw any, requestedModel string) *ChatResul
 		} else if t, ok := jsonGet(p, "text").(string); ok {
 			text.WriteString(t)
 		} else if fc := jsonGet(p, "functionCall"); fc != nil {
-			id := jsonStr(jsonGet(fc, "id"))
-			if id == "" {
-				// Same synthetic-ID scheme as the streaming path (name-based, not
-				// positional) so a call's id is stable across stream vs non-stream.
-				id = "call_" + jsonStr(jsonGet(fc, "name"))
-			}
-			toolCalls = append(toolCalls, ToolCall{
-				ID:        id,
-				Name:      jsonStr(jsonGet(fc, "name")),
-				Arguments: geminiStringifyArgs(jsonGet(fc, "args")),
-			})
+			toolCalls = append(toolCalls, geminiToolCall(p, fc, len(toolCalls)))
 		}
 	}
 
@@ -200,19 +203,31 @@ func (c *geminiConnector) parseResult(raw any, requestedModel string) *ChatResul
 	return res
 }
 
+// geminiStreamState is what a Gemini stream carries across chunks: the next
+// tool-call Index (so parallel calls are never merged and synthetic ids match
+// the non-stream ones), whether any functionCall was seen (so the terminal
+// finishReason maps to "tool_calls"), and whether the finish was already sent.
+type geminiStreamState struct {
+	status          int
+	toolIndex       int
+	sawFunctionCall bool
+	finished        bool
+	lastUsage       any
+}
+
 // mapStreamChunk normalizes one Gemini SSE chunk into zero or more deltas. A
 // chunk may carry text parts, one OR MORE functionCall parts, a finishReason,
-// and/or usageMetadata. Each functionCall part becomes its own ToolCallDelta
-// with a monotonically increasing Index (toolIndex, stateful across chunks) so
-// parallel/multiple calls are never merged; text is concatenated into a single
-// content delta and any finish/usage ride on a trailing delta. sawFunctionCall
-// is stateful so a terminal finishReason maps to "tool_calls".
-func (c *geminiConnector) mapStreamChunk(chunk any, sawFunctionCall *bool, toolIndex *int) ([]*ChatStreamDelta, error) {
-	// A mid-stream {"error":{...}} frame must abort with a *ConnectorError; the
-	// frame carries an HTTP-style code, so classify with it.
+// and/or usageMetadata. Each functionCall part becomes its own ToolCallDelta;
+// text is concatenated into a single content delta and the finish rides on a
+// trailing delta. usageMetadata is cumulative on every chunk, so it is reported
+// exactly once, on the finish delta; a chunk after the finish adds nothing.
+func (c *geminiConnector) mapStreamChunk(chunk any, st *geminiStreamState) ([]*ChatStreamDelta, error) {
+	// A mid-stream {"error":{...}} frame must abort with a *ConnectorError,
+	// classified by the frame's HTTP-style code or, without one, its google.rpc
+	// status name.
 	if e := jsonGet(chunk, "error"); e != nil {
 		msg := extractErrorMessage(chunk)
-		return nil, streamFrameError(geminiMapCode(int(jsonNum(jsonGet(e, "code"))), msg), msg, chunk)
+		return nil, streamFrameError(st.status, geminiMapCode(geminiFrameStatus(e), msg, chunk), msg, chunk)
 	}
 
 	var deltas []*ChatStreamDelta
@@ -232,21 +247,19 @@ func (c *geminiConnector) mapStreamChunk(chunk any, sawFunctionCall *bool, toolI
 		} else if t, ok := jsonGet(p, "text").(string); ok && t != "" {
 			text.WriteString(t)
 		} else if fc := jsonGet(p, "functionCall"); fc != nil {
-			*sawFunctionCall = true
-			id := jsonStr(jsonGet(fc, "id"))
-			if id == "" {
-				id = "call_" + jsonStr(jsonGet(fc, "name"))
-			}
+			st.sawFunctionCall = true
+			tc := geminiToolCall(p, fc, st.toolIndex)
 			deltas = append(deltas, &ChatStreamDelta{
 				Raw: chunk,
 				ToolCallDelta: &ToolCallDelta{
-					Index:          *toolIndex,
-					ID:             id,
-					FunctionName:   jsonStr(jsonGet(fc, "name")),
-					ArgumentsDelta: geminiStringifyArgs(jsonGet(fc, "args")),
+					Index:            st.toolIndex,
+					ID:               tc.ID,
+					FunctionName:     tc.Name,
+					ArgumentsDelta:   tc.Arguments,
+					ProviderMetadata: tc.ProviderMetadata,
 				},
 			})
-			*toolIndex++
+			st.toolIndex++
 		}
 	}
 	// Text precedes the tool-call deltas (Gemini emits any prose first).
@@ -255,18 +268,19 @@ func (c *geminiConnector) mapStreamChunk(chunk any, sawFunctionCall *bool, toolI
 	}
 
 	fr := jsonStr(jsonGet(cand, "finishReason"))
-	usageRaw := jsonGet(chunk, "usageMetadata")
-	if fr != "" || usageRaw != nil {
+	if u := jsonGet(chunk, "usageMetadata"); u != nil {
+		st.lastUsage = u
+	}
+	if fr != "" && !st.finished {
+		st.finished = true
 		tail := &ChatStreamDelta{Raw: chunk}
-		if fr != "" {
-			if *sawFunctionCall {
-				tail.FinishReason = "tool_calls"
-			} else {
-				tail.FinishReason = geminiMapFinishReason(fr)
-			}
+		if st.sawFunctionCall {
+			tail.FinishReason = "tool_calls"
+		} else {
+			tail.FinishReason = geminiMapFinishReason(fr)
 		}
-		if usageRaw != nil {
-			u := geminiMapUsage(usageRaw)
+		if st.lastUsage != nil {
+			u := geminiMapUsage(st.lastUsage)
 			tail.Usage = &u
 		}
 		deltas = append(deltas, tail)
@@ -277,7 +291,7 @@ func (c *geminiConnector) mapStreamChunk(chunk any, sawFunctionCall *bool, toolI
 
 func geminiVendorError(resp *http.Response, raw any) *ConnectorError {
 	msg := extractErrorMessage(raw)
-	ce := vendorError(resp.StatusCode, geminiMapCode(resp.StatusCode, msg), msg, raw, resp.Header)
+	ce := vendorError(resp.StatusCode, geminiMapCode(resp.StatusCode, msg, raw), msg, raw, resp.Header)
 	// Gemini has no rate-limit headers — retry timing lives in the 429 body's
 	// RetryInfo detail. Fill it in only when the Retry-After header didn't.
 	if cause, ok := ce.Cause.(map[string]any); ok {
@@ -300,19 +314,53 @@ func geminiFirstCandidate(raw any) any {
 	return nil
 }
 
+// geminiSkipSignature is Google's documented placeholder thoughtSignature. It
+// tells the validator to accept a functionCall whose real signature is unknown
+// (a hand-built history, or one from another provider); without any signature
+// Gemini 3 rejects the turn with a 400.
+const geminiSkipSignature = "skip_thought_signature_validator"
+
+// geminiSyntheticIDRe matches the ids this connector invents when Gemini sends
+// a functionCall without one. They never go back on the wire: Gemini did not
+// issue them, and it pairs a response with its call by name when ids are absent.
+var geminiSyntheticIDRe = regexp.MustCompile(`^call_[0-9]+$`)
+
+// geminiToolCall normalizes one functionCall part. Gemini's own id is kept;
+// when it is absent the id is synthesized from the call's ordinal, so parallel
+// calls to the same function stay distinct and stream and non-stream agree.
+// The part's thoughtSignature is kept in ProviderMetadata["gemini"] so the
+// next request can hand it back.
+func geminiToolCall(part, fc any, ordinal int) ToolCall {
+	id := jsonStr(jsonGet(fc, "id"))
+	if id == "" {
+		id = "call_" + strconv.Itoa(ordinal)
+	}
+	tc := ToolCall{
+		ID:        id,
+		Name:      jsonStr(jsonGet(fc, "name")),
+		Arguments: geminiStringifyArgs(jsonGet(fc, "args")),
+	}
+	if sig := jsonStr(jsonGet(part, "thoughtSignature")); sig != "" {
+		tc.ProviderMetadata = map[string]any{"gemini": map[string]any{"thoughtSignature": sig}}
+	}
+	return tc
+}
+
+// geminiVendorID reports whether a ToolCall id may go back to Gemini as a
+// functionCall / functionResponse id.
+func geminiVendorID(id string) bool {
+	return id != "" && !geminiSyntheticIDRe.MatchString(id)
+}
+
 // geminiSplitMessages folds system messages into a single systemInstruction and
 // maps the rest into Gemini's contents[]. Tool-result messages become
 // functionResponse parts keyed by function name and are batched onto a trailing
 // user turn (matching how Gemini expects parallel tool results).
 func geminiSplitMessages(messages []ChatMessage) (systemInstruction map[string]any, contents []any) {
+	// nameByID is filled as the history is walked, so a tool result resolves
+	// against the assistant turn before it; synthetic ids repeat from turn to
+	// turn ("call_0"), so a whole-history map would resolve to the wrong name.
 	nameByID := map[string]string{}
-	for _, m := range messages {
-		if m.Role == "assistant" {
-			for _, tc := range m.ToolCalls {
-				nameByID[tc.ID] = tc.Name
-			}
-		}
-	}
 
 	var systemText string
 	contents = []any{}
@@ -336,12 +384,14 @@ func geminiSplitMessages(messages []ChatMessage) (systemInstruction map[string]a
 			if name == "" {
 				name = "tool"
 			}
-			part := map[string]any{
-				"functionResponse": map[string]any{
-					"name":     name,
-					"response": map[string]any{"result": geminiParseJSONOrString(geminiContentToText(m))},
-				},
+			fr := map[string]any{
+				"name":     name,
+				"response": map[string]any{"result": geminiParseJSONOrString(geminiContentToText(m))},
 			}
+			if geminiVendorID(m.ToolCallID) {
+				fr["id"] = m.ToolCallID
+			}
+			part := map[string]any{"functionResponse": fr}
 			if n := len(contents); n > 0 {
 				if last, ok := contents[n-1].(map[string]any); ok &&
 					last["role"] == "user" && geminiIsFunctionResponseParts(last["parts"]) {
@@ -354,6 +404,9 @@ func geminiSplitMessages(messages []ChatMessage) (systemInstruction map[string]a
 			role := "user"
 			if m.Role == "assistant" {
 				role = "model"
+				for _, tc := range m.ToolCalls {
+					nameByID[tc.ID] = tc.Name
+				}
 			}
 			contents = append(contents, map[string]any{"role": role, "parts": geminiMapParts(m)})
 		}
@@ -392,8 +445,27 @@ func geminiMapParts(m ChatMessage) []any {
 		parts = append(parts, map[string]any{"text": m.Content})
 	}
 	if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+		signed := false
+		first := -1
 		for _, tc := range m.ToolCalls {
-			parts = append(parts, map[string]any{"functionCall": map[string]any{"name": tc.Name, "args": geminiSafeJSONParse(tc.Arguments)}})
+			fc := map[string]any{"name": tc.Name, "args": geminiSafeJSONParse(tc.Arguments)}
+			if geminiVendorID(tc.ID) {
+				fc["id"] = tc.ID
+			}
+			part := map[string]any{"functionCall": fc}
+			if sig := jsonStr(jsonGet(tc.ProviderMetadata["gemini"], "thoughtSignature")); sig != "" {
+				part["thoughtSignature"] = sig
+				signed = true
+			}
+			if first < 0 {
+				first = len(parts)
+			}
+			parts = append(parts, part)
+		}
+		// Gemini validates the signature on the turn's first functionCall; a
+		// turn that carries none of its own gets the documented placeholder.
+		if !signed {
+			parts[first].(map[string]any)["thoughtSignature"] = geminiSkipSignature
 		}
 	}
 	if len(parts) == 0 {
@@ -442,7 +514,9 @@ func geminiApplyResponseFormat(gc map[string]any, rf *ResponseFormat) {
 	case "json_schema":
 		gc["responseMimeType"] = "application/json"
 		if rf.JSONSchema != nil {
-			gc["responseSchema"] = rf.JSONSchema
+			// responseJsonSchema takes standard JSON Schema; responseSchema is the
+			// OpenAPI subset Google now steers away from.
+			gc["responseJsonSchema"] = rf.JSONSchema
 		}
 	}
 }
@@ -451,23 +525,28 @@ func geminiMapFinishReason(fr string) FinishReason {
 	switch fr {
 	case "STOP":
 		return "stop"
-	case "MAX_TOKENS":
+	case "MAX_TOKENS", "CONTINUATION":
+		// CONTINUATION: the per-request token limit cut generation short.
 		return "length"
-	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII":
+	case "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+		"IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_RECITATION":
 		return "content_filter"
 	default:
+		// LANGUAGE, MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL,
+		// TOO_MANY_TOOL_CALLS, NO_IMAGE, IMAGE_OTHER, OTHER, unspecified, and any
+		// value added later have no normalized equivalent.
 		return "unknown"
 	}
 }
 
+// geminiMapUsage counts every billed token: tool-use prompt tokens are input
+// and thinking tokens are output, though Gemini reports both apart from
+// promptTokenCount / candidatesTokenCount. The total is their sum, which is
+// what totalTokenCount documents.
 func geminiMapUsage(u any) Usage {
-	inp := int(jsonNum(jsonGet(u, "promptTokenCount")))
-	out := int(jsonNum(jsonGet(u, "candidatesTokenCount")))
-	total := int(jsonNum(jsonGet(u, "totalTokenCount")))
-	if total == 0 {
-		total = inp + out
-	}
-	return Usage{InputTokens: inp, OutputTokens: out, TotalTokens: total}
+	inp := int(jsonNum(jsonGet(u, "promptTokenCount")) + jsonNum(jsonGet(u, "toolUsePromptTokenCount")))
+	out := int(jsonNum(jsonGet(u, "candidatesTokenCount")) + jsonNum(jsonGet(u, "thoughtsTokenCount")))
+	return Usage{InputTokens: inp, OutputTokens: out, TotalTokens: inp + out}
 }
 
 func geminiEffortBudget(effort string) int {
@@ -511,23 +590,68 @@ func geminiParseJSONOrString(s string) any {
 	return v
 }
 
-func geminiMapCode(status int, message string) ProviderCode {
+func geminiMapCode(status int, message string, body any) ProviderCode {
 	switch {
 	case status == 401 || status == 403:
 		return CodeAuthFailed
-	case status == 429:
+	// 402 is RESOURCE_EXHAUSTED (prepay credit depleted), the same status as
+	// a 429 quota hit.
+	case status == 429 || status == 402:
 		return CodeRateLimited
-	case status >= 500:
+	// 408 is a transient timeout; Gemini's troubleshooting guide says to retry it.
+	case status >= 500 || status == 408:
 		return CodeProviderUnavailable
 	}
-	if status == 400 || status == 404 || status == 422 {
-		msg := strings.ToLower(message)
-		if strings.Contains(msg, "too long") || strings.Contains(msg, "context") || strings.Contains(msg, "token count") {
+	if status == 400 || status == 404 || status == 413 || status == 422 {
+		// A bad key is a 400 INVALID_ARGUMENT whose ErrorInfo reason is
+		// API_KEY_INVALID; it is a credential failure, not a malformed request.
+		if geminiErrorReason(body) == "API_KEY_INVALID" {
+			return CodeAuthFailed
+		}
+		// "The input token count (N) exceeds the maximum number of tokens
+		// allowed (M)." A looser match ("context", "maximum number of tokens"
+		// alone) also catches maxOutputTokens validation errors.
+		if strings.Contains(strings.ToLower(message), "exceeds the maximum number of tokens") {
 			return CodeContextLengthExceeded
 		}
 		return CodeInvalidRequest
 	}
+	// Any other 4xx: the request cannot succeed as sent.
+	if status >= 400 && status < 500 {
+		return CodeInvalidRequest
+	}
 	return CodeUnknown
+}
+
+// geminiRPCStatus is the HTTP status for each google.rpc status name an error
+// frame can carry instead of a numeric code.
+var geminiRPCStatus = map[string]int{
+	"INVALID_ARGUMENT": 400, "FAILED_PRECONDITION": 400, "OUT_OF_RANGE": 400,
+	"UNAUTHENTICATED": 401, "PERMISSION_DENIED": 403, "NOT_FOUND": 404,
+	"ABORTED": 409, "ALREADY_EXISTS": 409, "RESOURCE_EXHAUSTED": 429, "CANCELLED": 499,
+	"INTERNAL": 500, "UNKNOWN": 500, "DATA_LOSS": 500, "UNIMPLEMENTED": 501,
+	"UNAVAILABLE": 503, "DEADLINE_EXCEEDED": 504,
+}
+
+// geminiFrameStatus reads the HTTP status a mid-stream error frame stands for:
+// error.code, else the google.rpc error.status name, else 0 (which classifies
+// as unknown).
+func geminiFrameStatus(e any) int {
+	if n, ok := jsonGet(e, "code").(float64); ok && n >= 400 && n <= 599 && n == math.Trunc(n) {
+		return int(n)
+	}
+	return geminiRPCStatus[jsonStr(jsonGet(e, "status"))]
+}
+
+// geminiErrorReason returns the reason of the first google.rpc.ErrorInfo detail.
+func geminiErrorReason(body any) string {
+	details, _ := jsonSliceVal(jsonGet(jsonGet(body, "error"), "details"))
+	for _, d := range details {
+		if r := jsonStr(jsonGet(d, "reason")); r != "" {
+			return r
+		}
+	}
+	return ""
 }
 
 var geminiRetryDelayRe = regexp.MustCompile(`^(\d+(?:\.\d+)?)s$`)

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,8 @@ const bedrockDefaultMaxTokens = 4096
 
 // bedrockService is the AWS service name folded into the SigV4 credential scope.
 const bedrockService = "bedrock"
+
+var bedrockRegionRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 func init() { registerNativeChat(Bedrock, newBedrockChat) }
 
@@ -31,6 +34,12 @@ func newBedrockChat(cfg ChatConfig, o facadeOptions) (chatConnector, error) {
 	if !ok {
 		return nil, invalidReq("bedrock requires a BedrockConfig")
 	}
+	// Region becomes part of the default host and of the SigV4 scope. Anything
+	// but a single DNS label ("us-east-1") could steer the signed request,
+	// session token included, to another host ("x.evil.example#").
+	if !bedrockRegionRe.MatchString(c.Region) {
+		return nil, invalidReq("Bedrock: `Region` must be an AWS region name such as us-east-1, got " + strconv.Quote(c.Region))
+	}
 	origin := c.BaseURL
 	if origin == "" {
 		origin = "https://bedrock-runtime." + c.Region + ".amazonaws.com"
@@ -41,11 +50,29 @@ func newBedrockChat(cfg ChatConfig, o facadeOptions) (chatConnector, error) {
 		return nil, invalidReq("Bedrock: invalid `baseUrl`/`region` — could not derive a host from '" + origin + "'")
 	}
 	return &bedrockConnector{
-		baseConnector: baseConnector{o.httpClient},
-		cfg:           c,
-		origin:        origin,
-		host:          u.Host,
+		baseConnector:   baseConnector{o.httpClient},
+		cfg:             c,
+		origin:          origin,
+		host:            u.Host,
+		canonicalPrefix: bedrockCanonicalPrefix(u.EscapedPath()),
 	}, nil
+}
+
+// bedrockCanonicalPrefix returns the SigV4 canonical form of a BaseURL path
+// prefix (a gateway mount point such as "/proxy/bedrock"). The wire URL carries
+// the prefix, so the signature must cover it too, encoded once more per segment
+// as for the model id; otherwise every request through such a gateway fails
+// with SignatureDoesNotMatch. The default endpoints have no prefix.
+func bedrockCanonicalPrefix(escapedPath string) string {
+	trimmed := strings.Trim(escapedPath, "/")
+	if trimmed == "" {
+		return ""
+	}
+	segments := strings.Split(trimmed, "/")
+	for i, s := range segments {
+		segments[i] = bedrockEscapeModelID(s)
+	}
+	return "/" + strings.Join(segments, "/")
 }
 
 type bedrockConnector struct {
@@ -53,6 +80,9 @@ type bedrockConnector struct {
 	cfg    BedrockConfig
 	origin string // baseURL, trailing slashes trimmed
 	host   string // host derived from origin (participates in the SigV4 signature)
+	// canonicalPrefix is origin's path prefix in SigV4 canonical form ("" for
+	// the default endpoints).
+	canonicalPrefix string
 }
 
 func (c *bedrockConnector) complete(ctx context.Context, in ChatInput) (*ChatResult, error) {
@@ -66,11 +96,16 @@ func (c *bedrockConnector) complete(ctx context.Context, in ChatInput) (*ChatRes
 	if err != nil {
 		return nil, err
 	}
-	raw := decodeAny(readBody(resp))
+	raw, readErr := readJSON(resp)
 	if !okStatus(resp.StatusCode) {
 		return nil, bedrockVendorError(resp, raw)
 	}
-	if raw == nil {
+	if readErr != nil {
+		return nil, transportError(readErr)
+	}
+	// Converse always returns an output object; a body without one is not a
+	// completion.
+	if _, ok := jsonGet(raw, "output").(map[string]any); !ok {
 		return nil, emptyBodyError(resp.StatusCode)
 	}
 	return c.parseResult(raw, in.Model), nil
@@ -87,6 +122,11 @@ func (c *bedrockConnector) stream(ctx context.Context, in ChatInput) (*ChatStrea
 	result, err := c.complete(ctx, in)
 	if err != nil {
 		return nil, err
+	}
+	// Converse always reports why the model stopped; without a stopReason the
+	// answer may be cut off, and replaying it as a complete stream would hide that.
+	if jsonStr(jsonGet(result.Raw, "stopReason")) == "" {
+		return nil, streamEndedEarlyError()
 	}
 	var deltas []*ChatStreamDelta
 	if result.Message.Content != "" {
@@ -144,7 +184,7 @@ func (c *bedrockConnector) buildSignedRequest(in ChatInput) (string, []byte, map
 	// signature (double-encoded). They differ for any model id containing a
 	// reserved char (e.g. the ':' in "...-v2:0", cross-region "us." profiles, ARNs).
 	wirePath := "/model/" + bedrockEscapeModelID(in.Model) + "/converse"
-	canonicalPath := "/model/" + bedrockEscapeModelID(bedrockEscapeModelID(in.Model)) + "/converse"
+	canonicalPath := c.canonicalPrefix + "/model/" + bedrockEscapeModelID(bedrockEscapeModelID(in.Model)) + "/converse"
 	// A per-request Passthrough.Query must be BOTH signed (SigV4 CanonicalQuery)
 	// and put on the wire, using the same canonical (sorted, RFC3986) encoding, so
 	// the signature matches what the transport sends (mirrors the openai-compat
@@ -234,7 +274,11 @@ func (c *bedrockConnector) buildRequest(in ChatInput) map[string]any {
 	}
 	body["inferenceConfig"] = inferenceConfig
 
-	if len(in.Tools) > 0 {
+	// Converse has no "none" tool choice, so "none" omits the tools entirely:
+	// sending them with no choice would let the model call one anyway. A
+	// history holding toolUse/toolResult blocks then gets Bedrock's own 400.
+	omitTools := in.ToolChoice != nil && in.ToolChoice.Mode == "none"
+	if len(in.Tools) > 0 && !omitTools {
 		tools := make([]any, 0, len(in.Tools))
 		for _, t := range in.Tools {
 			spec := map[string]any{"name": t.Name}
@@ -285,13 +329,13 @@ func (c *bedrockConnector) parseResult(raw any, requestedModel string) *ChatResu
 		}
 	}
 
+	// Cache reads and writes are reported apart from inputTokens but are billed
+	// input, so they count; the total is input + output, consistent with both.
 	usage := jsonGet(raw, "usage")
-	inTok := int(jsonNum(jsonGet(usage, "inputTokens")))
+	inTok := int(jsonNum(jsonGet(usage, "inputTokens")) + jsonNum(jsonGet(usage, "cacheReadInputTokens")) +
+		jsonNum(jsonGet(usage, "cacheWriteInputTokens")))
 	outTok := int(jsonNum(jsonGet(usage, "outputTokens")))
-	total := int(jsonNum(jsonGet(usage, "totalTokens")))
-	if total == 0 {
-		total = inTok + outTok
-	}
+	total := inTok + outTok
 
 	return &ChatResult{
 		Message:      AssistantMessage{Role: "assistant", Content: text.String(), ToolCalls: toolCalls},
@@ -361,7 +405,10 @@ func bedrockMapContentBlocks(m ChatMessage) []any {
 	if len(m.ContentParts) > 0 {
 		for _, p := range m.ContentParts {
 			if p.Type == "text" {
-				blocks = append(blocks, map[string]any{"text": p.Text})
+				// Converse rejects a blank text block, so an empty part is dropped.
+				if p.Text != "" {
+					blocks = append(blocks, map[string]any{"text": p.Text})
+				}
 			} else {
 				blocks = append(blocks, map[string]any{"image": map[string]any{
 					"format": bedrockImageFormat(p.MediaType),
@@ -420,13 +467,14 @@ func bedrockMapStopReason(sr string) FinishReason {
 	switch sr {
 	case "end_turn", "stop_sequence":
 		return "stop"
-	case "max_tokens":
+	case "max_tokens", "model_context_window_exceeded":
 		return "length"
 	case "tool_use":
 		return "tool_calls"
 	case "content_filtered", "guardrail_intervened":
 		return "content_filter"
 	default:
+		// malformed_model_output / malformed_tool_use have no normalized equivalent.
 		return "unknown"
 	}
 }
@@ -476,20 +524,32 @@ func bedrockMapCode(status int, message string) ProviderCode {
 	switch {
 	case status == 401 || status == 403:
 		return CodeAuthFailed
-	case status == 429:
+	// 402 is out of credit, grouped with the quota 429 as on every connector.
+	case status == 429 || status == 402:
 		return CodeRateLimited
-	case status >= 500:
+	// 408 ModelTimeoutException and 424 ModelErrorException are failures while
+	// the model ran, not problems with the request.
+	case status >= 500 || status == 408 || status == 424:
 		return CodeProviderUnavailable
 	}
-	if status == 400 || status == 404 || status == 422 {
+	if status == 400 || status == 404 || status == 413 || status == 422 {
 		msg := strings.ToLower(message)
 		if strings.Contains(msg, "throttl") {
 			return CodeRateLimited
 		}
-		if strings.Contains(msg, "too long") || strings.Contains(msg, "context") ||
-			strings.Contains(msg, "token") || strings.Contains(msg, "max") {
+		// ValidationException says "Input is too long for requested model.",
+		// or relays the model provider's own text ("prompt is too long",
+		// "maximum context length", "exceed context limit"). Matching any
+		// "token" or "max" also caught maxTokens validation errors.
+		if strings.Contains(msg, "input is too long") || strings.Contains(msg, "prompt is too long") ||
+			strings.Contains(msg, "too many input tokens") || strings.Contains(msg, "maximum context length") ||
+			strings.Contains(msg, "exceed context limit") {
 			return CodeContextLengthExceeded
 		}
+		return CodeInvalidRequest
+	}
+	// Any other 4xx: the request cannot succeed as sent.
+	if status >= 400 && status < 500 {
 		return CodeInvalidRequest
 	}
 	return CodeUnknown

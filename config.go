@@ -21,7 +21,8 @@ type AnthropicConfig struct {
 	BaseURL string
 	// AnthropicVersion is the anthropic-version header (default 2023-06-01).
 	AnthropicVersion string
-	// DefaultMaxTokens is used when ChatInput.MaxOutputTokens is unset (default 4096).
+	// DefaultMaxTokens is used when ChatInput.MaxOutputTokens is unset (default
+	// 16000; thinking counts toward it).
 	DefaultMaxTokens int
 	Headers          map[string]string
 }
@@ -30,6 +31,8 @@ func (AnthropicConfig) isChatConfig() {}
 
 // BedrockConfig configures the AWS Bedrock Converse native adapter (SigV4).
 type BedrockConfig struct {
+	// Region (e.g. "us-east-1") must be a single DNS label: it is part of the
+	// default host and the SigV4 scope.
 	Region          string
 	AccessKeyID     string
 	SecretAccessKey string

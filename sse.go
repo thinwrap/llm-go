@@ -23,6 +23,9 @@ type sseScanner struct {
 	sc   *bufio.Scanner
 	body io.ReadCloser
 	done bool
+	// sawDone records the OpenAI-style `[DONE]` sentinel, one of the ways a
+	// stream proves it was not cut off.
+	sawDone bool
 	// err holds a non-EOF read failure (mid-stream TCP drop, ctx cancellation, or
 	// bufio.ErrTooLong) so recv can surface it instead of a clean EOF.
 	err error
@@ -60,6 +63,7 @@ func (s *sseScanner) next() (payload string, ok bool) {
 			p := strings.Join(dataParts, "\n")
 			if p == "[DONE]" {
 				s.done = true
+				s.sawDone = true
 				return "", false
 			}
 			return p, true
@@ -89,6 +93,7 @@ func (s *sseScanner) next() (payload string, ok bool) {
 		if p := strings.Join(dataParts, "\n"); p != "[DONE]" {
 			return p, true
 		}
+		s.sawDone = true
 	}
 	return "", false
 }
@@ -113,12 +118,47 @@ func oneDelta(d *ChatStreamDelta, err error) ([]*ChatStreamDelta, error) {
 	return []*ChatStreamDelta{d}, nil
 }
 
+// requireEventStream guards a 2xx streaming response before it is read as SSE.
+// A body labelled as anything but text/event-stream (a JSON completion from a
+// proxy that dropped `stream: true`, an HTML gateway page) holds no events, so
+// reading it would end the stream with nothing and no error. A missing
+// Content-Type is let through; the end-of-stream check still catches an empty
+// body.
+func requireEventStream(resp *http.Response) error {
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct == "" || strings.Contains(strings.ToLower(ct), "text/event-stream") {
+		return nil
+	}
+	if resp.Body != nil {
+		resp.Body.Close()
+	}
+	mediaType := strings.TrimSpace(strings.SplitN(ct, ";", 2)[0])
+	msg := "Provider returned a successful status with a non-SSE body (" + mediaType + ") for a streaming request"
+	s := resp.StatusCode
+	return &ConnectorError{StatusCode: &s, ProviderCode: CodeProviderUnavailable, Message: msg, ProviderMessage: msg}
+}
+
+// streamEndedEarlyError is the error for a stream whose body ended before the
+// provider's terminal event. Every supported provider closes a complete stream
+// with one, so an EOF before it is a truncated answer (dropped connection,
+// proxy timeout), not a short one.
+func streamEndedEarlyError() *ConnectorError {
+	msg := "Stream ended before the provider sent its terminal event"
+	return &ConnectorError{ProviderCode: CodeProviderUnavailable, Message: msg, ProviderMessage: msg}
+}
+
 // newChatStream wires a *ChatStream over an SSE response. mapChunk maps a decoded
 // vendor chunk to zero or more normalized deltas (a single chunk may carry, e.g.,
 // several tool-call fragments); return an empty slice to skip a chunk. A mapChunk
 // error (e.g. a mid-stream vendor error frame) is surfaced to the consumer.
-func newChatStream(resp *http.Response, mapChunk func(chunk any) ([]*ChatStreamDelta, error)) *ChatStream {
+//
+// A clean EOF counts as the end of the answer only after a terminal event: the
+// `[DONE]` sentinel, a delta carrying a FinishReason, or — when terminal is
+// non-nil — whatever else the connector reports through it. Otherwise the
+// stream ends with streamEndedEarlyError.
+func newChatStream(resp *http.Response, mapChunk func(chunk any) ([]*ChatStreamDelta, error), terminal func() bool) *ChatStream {
 	scanner := newSSEScanner(resp.Body)
+	sawFinish := false
 	var pending []*ChatStreamDelta
 	recv := func() (*ChatStreamDelta, error) {
 		for {
@@ -133,6 +173,9 @@ func newChatStream(resp *http.Response, mapChunk func(chunk any) ([]*ChatStreamD
 				if scanner.err != nil {
 					return nil, transportError(scanner.err)
 				}
+				if !scanner.sawDone && !sawFinish && (terminal == nil || !terminal()) {
+					return nil, streamEndedEarlyError()
+				}
 				return nil, io.EOF
 			}
 			chunk := decodeAny([]byte(payload))
@@ -145,6 +188,9 @@ func newChatStream(resp *http.Response, mapChunk func(chunk any) ([]*ChatStreamD
 			}
 			for _, d := range ds {
 				if d != nil {
+					if d.FinishReason != "" {
+						sawFinish = true
+					}
 					pending = append(pending, d)
 				}
 			}

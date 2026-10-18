@@ -3,7 +3,7 @@ name: Release (Go module)
 # Go has no package registry to push to — the public module proxy serves the
 # module directly from the git tag. This workflow therefore does NOT publish a
 # package; on a `v*.*.*` tag it (1) re-runs the gofmt/vet/build/test gates
-# against the tagged commit, (2) cuts a GitHub Release with generated notes,
+# against the tagged commit, (2) cuts a GitHub Release whose notes are the CHANGELOG section,
 # and (3) warms the public module proxy so `go get` and pkg.go.dev see the
 # version immediately.
 #
@@ -12,31 +12,54 @@ name: Release (Go module)
 # No registry account, no OIDC token, no bootstrap. The tag IS the release;
 # everything here is gate + convenience.
 #
-# Trigger: push of a `v*.*.*` tag (branch protection on `main` ensures the
-# tag's commit is on a protected branch).
+# Trigger: push of a `v*.*.*` tag. Branch protection does not cover tags, so
+# the gate refuses to release unless the tagged commit is on `main`.
 
 on:
   push:
     tags:
       - 'v*.*.*'
 
+# Read-only by default; only the `release` job, which runs after every gate
+# has passed, gets write access (to create the GitHub Release).
 permissions:
-  contents: write       # required to create the GitHub Release
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: gate + release github.com/thinwrap/llm-go
+  gate:
+    name: gate (go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        # Same versions as ci.yml, so a tag is gated exactly like main.
+        go: ['1.18', '1.22', '1.23']
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          go-version: '1.22'
+          fetch-depth: 0    # full history for the on-main ancestry check
+          persist-credentials: false  # the gate never pushes; the public repo fetches without a token
+
+      # Tags bypass branch protection; without this, a tag on any commit
+      # (for example on an unmerged branch) would get a GitHub Release and a
+      # proxy warm-up. The proxy still serves any pushed tag on request, so a
+      # stray tag must also be deleted, not just left unreleased.
+      - name: Verify the tagged commit is on main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tagged commit $GITHUB_SHA is not on main; refusing to release."
+            exit 1
+          fi
+          echo "Tagged commit $GITHUB_SHA is on main."
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ matrix.go }}
 
       - name: gofmt
         run: |
@@ -59,6 +82,24 @@ jobs:
           awk -v p="$pct" 'BEGIN { exit (p+0 >= 80 ? 0 : 1) }' \
             || { echo "coverage ${pct}% is below the 80% gate"; exit 1; }
 
+      - name: race detector
+        # Streams keep per-call state in closures; -race catches a shared one.
+        run: go test -race ./...
+
+  release:
+    name: release github.com/thinwrap/llm-go
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # required to create the GitHub Release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+          # gh reads GH_TOKEN from the env; the write token must not sit in .git/config.
+          persist-credentials: false
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,7 +107,17 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists; skipping."
+            exit 0
+          fi
+          # The notes are the version's CHANGELOG section, so the release page
+          # and the CHANGELOG never disagree.
+          tr -d '\r' < CHANGELOG.md \
+            | awk -v h="## [${tag#v}]" 'index($0, h) == 1 {f = 1; next} f && /^## \[/ {exit} f' \
+            | sed -E '/^\[[^]]*\]: https?:\/\//d' > notes.md
+          if grep -q '[^[:space:]]' notes.md; then
+            gh release create "$tag" --title "$tag" --notes-file notes.md --verify-tag
           else
+            echo "::warning::CHANGELOG.md has no section for ${tag#v}; using generated notes."
             gh release create "$tag" --title "$tag" --generate-notes --verify-tag
           fi
 
@@ -76,9 +127,15 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           mod="github.com/thinwrap/llm-go"
+          warmed=0
           for i in 1 2 3; do
             if curl -fsSL "https://proxy.golang.org/${mod}/@v/${tag}.info"; then
-              echo; echo "proxy warmed for ${mod}@${tag}"; break
+              echo; echo "proxy warmed for ${mod}@${tag}"; warmed=1; break
             fi
             echo "proxy not ready yet (attempt $i), retrying in 10s..."; sleep 10
           done
+          # A green job must mean the version is fetchable from the proxy.
+          if [ "$warmed" != 1 ]; then
+            echo "::error::proxy.golang.org did not serve ${mod}@${tag} after 3 attempts."
+            exit 1
+          fi

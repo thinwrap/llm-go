@@ -6,3 +6,6 @@ coverage.txt
 .DS_Store
 .idea/
 *.swp
+
+# IDE and editor settings
+.vscode/

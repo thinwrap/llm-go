@@ -60,16 +60,23 @@ func (b baseConnector) post(ctx context.Context, url, contentType string, body [
 // path is separately bounded per-event by maxSSEEventBytes.
 const maxResponseBytes = 32 << 20 // 32 MiB
 
-func readBody(resp *http.Response) []byte {
+// readBody reads (and closes) a response body, capped at maxResponseBytes. A
+// read failure (deadline, connection reset) is returned rather than folded into
+// an empty body, so a 2xx cut off mid-read surfaces as a transport error, not as
+// a misleading "empty body".
+func readBody(resp *http.Response) ([]byte, error) {
 	if resp.Body == nil {
-		return nil
+		return nil, nil
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if err != nil {
-		return nil
-	}
-	return data
+	return io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+}
+
+// readJSON reads and decodes a response body. raw is nil for an empty or
+// non-JSON body; err is only a read failure.
+func readJSON(resp *http.Response) (any, error) {
+	data, err := readBody(resp)
+	return decodeAny(data), err
 }
 
 var (

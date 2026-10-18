@@ -35,8 +35,10 @@ llm.NewChat(OpenAI, OpenAICompatConfig{...})   →  *Chat facade
 `Chat.Stream` returns a `*ChatStream` — a pull-based reader whose `Recv` returns
 the next `*ChatStreamDelta` or `io.EOF`. `sse.go` provides `newSSEScanner` (a
 `bufio`-based SSE event reader, bounded to 16 MB per event, tolerant of `\n\n`
-and `\r\n\r\n`, stopping at `[DONE]`) and `newChatStream(resp, mapChunk)`, where
-`mapChunk` maps one decoded vendor chunk to a delta (returning `nil` to skip).
+and `\r\n\r\n`, stopping at `[DONE]`), `requireEventStream` (a 2xx that is not
+`text/event-stream` is an error), and `newChatStream(resp, mapChunk, terminal)`,
+where `mapChunk` maps one decoded vendor chunk to zero or more deltas. A clean EOF
+before the provider's terminal event is an error, not the end of the answer.
 Stateful streams (Anthropic tracks input tokens across events) capture state in
 the `mapChunk` closure.
 

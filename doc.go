@@ -15,7 +15,7 @@
 //	chat, err := llm.NewChat(llm.OpenAI, llm.OpenAICompatConfig{APIKey: key})
 //	if err != nil { ... }
 //	res, err := chat.Complete(ctx, llm.ChatInput{
-//		Model:    "gpt-4o-mini",
+//		Model:    "gpt-5.5",
 //		Messages: []llm.ChatMessage{{Role: "user", Content: "Hello"}},
 //	})
 //	if err != nil {

@@ -19,7 +19,7 @@ chat, err := llm.NewChat(llm.OpenAI, llm.OpenAICompatConfig{APIKey: os.Getenv("O
 if err != nil { log.Fatal(err) }
 
 res, err := chat.Complete(ctx, llm.ChatInput{
-    Model:    "gpt-4o-mini",
+    Model:    "gpt-5.5",
     Messages: []llm.ChatMessage{{Role: "user", Content: "Say hi in one word."}},
 })
 if err != nil {
@@ -29,6 +29,10 @@ if err != nil {
 }
 fmt.Println(res.Message.Content, res.Usage.TotalTokens)
 ```
+
+`Usage.InputTokens` counts every billed prompt token, cache reads and writes
+included; `OutputTokens` includes reasoning tokens; `TotalTokens` is their sum
+(or the vendor's total). Streamed `Usage` is cumulative, so keep the last one.
 
 ## Streaming
 
@@ -43,6 +47,10 @@ for {
     fmt.Print(delta.ContentDelta)
 }
 ```
+
+`io.EOF` comes only after the provider's terminal event (`[DONE]` or a finish
+reason). A 2xx that is not `text/event-stream`, or a body cut off before that
+event, ends with a `provider_unavailable` `*ConnectorError` instead.
 
 ## Providers
 
@@ -73,12 +81,38 @@ Per-provider details (endpoint, auth, quirks, passthrough keys) live in
 ```go
 // Same Complete(ctx, in) call, same ChatResult — id + model change only.
 chat, _ := llm.NewChat(llm.Anthropic, llm.AnthropicConfig{APIKey: key})
-// then in.Model = "claude-sonnet-4-5", etc.
+// then in.Model = "claude-opus-5-5", etc.
 ```
 
 `OpenAICompatConfig` covers all 15 first-class providers (`APIKey`, `BaseURL`,
 `Headers`); `BaseURL` is required for `AzureOpenAI` / `Cloudflare` and any
 self-host provider on a non-default host.
+
+## Multi-turn and tool loops: `ProviderMetadata`
+
+Some vendors need opaque state from one turn sent back on the next: Gemini's
+`thoughtSignature` on each function call, and Anthropic's thinking blocks.
+`ToolCall.ProviderMetadata` and `ChatMessage.ProviderMetadata` carry it, keyed by
+provider id; a connector reads only its own key, so a history survives a
+provider switch. When you build the next request from a result, copy it along
+with the content and tool calls:
+
+```go
+msgs = append(msgs, llm.ChatMessage{
+    Role:             "assistant",
+    Content:          res.Message.Content,
+    ToolCalls:        res.Message.ToolCalls,        // each keeps its ProviderMetadata
+    ProviderMetadata: res.Message.ProviderMetadata,
+})
+```
+
+When streaming, collect `ToolCallDelta.ProviderMetadata` per call and the
+terminal delta's `ProviderMetadata` for the message. Copy the values as they
+came back (or JSON-decode a stored history into `any`): connectors read only the
+JSON-decoded shapes (`map[string]any`, `[]any`), so a hand-built typed value
+such as `map[string]string` is ignored. Dropping it is not fatal:
+Anthropic then loses earlier reasoning, and Gemini falls back to Google's
+documented signature placeholder.
 
 ## The ≥90% baseline & passthrough
 
@@ -99,9 +133,21 @@ _ = res.Raw // verbatim vendor body — reasoning CoT, cached-token counts, cost
 
 Every failure is a `*ConnectorError` (`errors.As`): `ProviderCode` is one of
 `rate_limited`, `auth_failed`, `provider_unavailable`, `invalid_request`,
-`context_length_exceeded`, `content_filtered`, `unknown`. The raw `Retry-After`
-rides in `Cause["retryAfter"]` (+ parsed `Cause["retryAfterSeconds"]`) — there is
-no top-level retry field.
+`context_length_exceeded`, `content_filtered`, `unknown`. By HTTP status:
+401/403 → `auth_failed`, 402/429 → `rate_limited`, 408 and 5xx →
+`provider_unavailable`, any other 4xx → `invalid_request` unless the body names
+a context overflow or a content filter. The raw `Retry-After` rides in
+`Cause["retryAfter"]` (+ parsed `Cause["retryAfterSeconds"]`: whole seconds, or
+an HTTP-date as seconds from now with a past date giving 0; absent for anything
+else) — there is no top-level retry field. A 2xx whose body carries a vendor
+error, or lacks the payload a result requires (`choices`, `content`, `output`,
+`candidates`, one finite float vector per embeddings input), is a
+`*ConnectorError` too — never an empty success. An error that arrives inside a
+stream carries the stream's own HTTP status (normally 200) and is classified by
+the vendor's error type or code (`unknown` when the frame has neither).
+
+The wrapper sets no timeout of its own: bound each call with the `ctx` you pass
+(or your own `*http.Client`).
 
 ## Relationship to the siblings
 

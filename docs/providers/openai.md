@@ -9,7 +9,7 @@ import "github.com/thinwrap/llm-go"
 
 chat, err := llm.NewChat(llm.OpenAI, llm.OpenAICompatConfig{APIKey: os.Getenv("OPENAI_API_KEY")})
 res, err := chat.Complete(ctx, llm.ChatInput{
-	Model:    "gpt-4o",
+	Model:    "gpt-5.5",
 	Messages: []llm.ChatMessage{{Role: "user", Content: "Hi"}},
 })
 ```
@@ -39,8 +39,9 @@ Create an API key at <https://platform.openai.com/api-keys>. It is sent verbatim
 ### Notes / quirks
 
 - The reference provider — its Chat Completions shape is the canonical facade shape.
-- `MaxOutputTokens` maps to `max_tokens`. `Reasoning.Effort` maps to `reasoning_effort`.
-- Reasoning models (o-series / GPT-5-class) reject `temperature`/`top_p`/penalties with HTTP 400 and want `max_completion_tokens`; guard by model family and route those via `Passthrough.Body` rather than the normalized sampling fields.
+- `MaxOutputTokens` maps to `max_completion_tokens` (OpenAI deprecated `max_tokens`, which o-series models reject; the cap includes reasoning tokens). `Reasoning.Effort` maps to `reasoning_effort`.
+- Reasoning models (o-series / GPT-5-class) reject `temperature`/`top_p`/penalties with HTTP 400; guard by model family and leave those normalized sampling fields unset.
+- **Function tools with reasoning (Chat Completions):** current models (gpt-5.4, gpt-5.4-mini, gpt-5.5, the gpt-5.6 family) reject `Tools` combined with reasoning with a 400, which passes through as `invalid_request`; gpt-5.6 does so even with `Reasoning` unset, because it reasons by default. To call tools on Chat Completions, send `Passthrough.Body["reasoning_effort"] = "none"` (accepted on gpt-5.4 and later; gpt-5-mini and o4-mini reject `"none"`). Moving this connector to the Responses API, which combines both, is planned.
 - OpenAI also ships the newer Responses API; this connector targets Chat Completions.
 - Streaming via `chat.Stream(ctx, in)` → read `*ChatStream` with `Recv()` until `io.EOF`, then `Close()`. `stream_options.include_usage` is set so the final chunk carries `Usage`.
 
@@ -62,4 +63,4 @@ out, err := emb.Create(ctx, llm.EmbeddingsInput{
 
 - Non-2xx returns a `*llm.ConnectorError` (reachable via `errors.As`) with `ProviderCode` in `rate_limited` / `auth_failed` / `provider_unavailable` / `invalid_request` / `context_length_exceeded` / `content_filtered` / `unknown`.
 - `Retry-After` (when present) is on `Cause["retryAfter"]` (raw) and `Cause["retryAfterSeconds"]` (parsed); the raw vendor body is on `Cause["raw"]`.
-- Sub-baseline request fields (`seed`, `frequency`/`presence_penalty`, `logit_bias`, `n`, prompt caching, `max_completion_tokens`) go via `Passthrough.Body` / `.Headers` / `.Query`; vendor extras on the response are on `ChatResult.Raw`.
+- Sub-baseline request fields (`seed`, `frequency`/`presence_penalty`, `logit_bias`, `n`, prompt caching) go via `Passthrough.Body` / `.Headers` / `.Query`; vendor extras on the response are on `ChatResult.Raw`.

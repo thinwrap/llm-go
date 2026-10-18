@@ -66,8 +66,6 @@ func TestSigV4QueryHelpers(t *testing.T) {
 }
 
 func kitchenSink(mode, effort string) ChatInput {
-	// mx must exceed the largest reasoning budget (Gemini "high" = 24576) so the
-	// reasoning combos below don't trip the max_output_tokens<=budget guard.
 	temp, tp, mx := 0.5, 0.9, 32000
 	in := ChatInput{
 		Model: "m",
@@ -94,24 +92,25 @@ func kitchenSink(mode, effort string) ChatInput {
 
 // TestNativeBuildRequestBranches drives each native's Complete over the
 // tool-choice modes and reasoning efforts to exercise buildRequest, message
-// splitting, content mapping, and tool-choice/effort helpers. A tolerant empty
-// 200 body means parseResult succeeds without an error.
+// splitting, content mapping, and tool-choice/effort helpers. Each connector
+// gets the smallest body its wire contract calls a completion.
 func TestNativeBuildRequestBranches(t *testing.T) {
 	cfgs := []struct {
-		id  ProviderID
-		cfg ChatConfig
+		id   ProviderID
+		cfg  ChatConfig
+		body string
 	}{
-		{Anthropic, AnthropicConfig{APIKey: "k"}},
-		{Bedrock, BedrockConfig{Region: "us-east-1", AccessKeyID: "a", SecretAccessKey: "s"}},
-		{Gemini, GeminiConfig{APIKey: "k"}},
-		{OpenAI, OpenAICompatConfig{APIKey: "k"}},
+		{Anthropic, AnthropicConfig{APIKey: "k"}, `{"content":[]}`},
+		{Bedrock, BedrockConfig{Region: "us-east-1", AccessKeyID: "a", SecretAccessKey: "s"}, `{"output":{"message":{"role":"assistant","content":[]}}}`},
+		{Gemini, GeminiConfig{APIKey: "k"}, `{"candidates":[]}`},
+		{OpenAI, OpenAICompatConfig{APIKey: "k"}, `{"choices":[{"message":{"content":""}}]}`},
 	}
 	modes := []string{"auto", "none", "required", "function", ""}
 	efforts := []string{"low", "medium", "high", ""}
 	for _, c := range cfgs {
 		for _, mode := range modes {
 			for _, effort := range efforts {
-				fake := newFake(resp(200, "{}"))
+				fake := newFake(resp(200, c.body))
 				chat, err := NewChat(c.id, c.cfg, WithHTTPClient(fake))
 				if err != nil {
 					t.Fatalf("%s NewChat: %v", c.id, err)
@@ -124,12 +123,10 @@ func TestNativeBuildRequestBranches(t *testing.T) {
 	}
 }
 
-// TestNativeErrorMatrix exercises each connector's status→code classifier.
-func TestNativeErrorMatrix(t *testing.T) {
-	valid := map[ProviderCode]bool{
-		CodeRateLimited: true, CodeAuthFailed: true, CodeProviderUnavailable: true,
-		CodeInvalidRequest: true, CodeContextLengthExceeded: true, CodeContentFiltered: true, CodeUnknown: true,
-	}
+// TestEmptyObjectOn2xxErrors: a 2xx `{}` decodes as JSON but carries none of the
+// payload a completion requires, so every connector must fail rather than
+// return an empty "successful" result.
+func TestEmptyObjectOn2xxErrors(t *testing.T) {
 	cfgs := []struct {
 		id  ProviderID
 		cfg ChatConfig
@@ -138,20 +135,63 @@ func TestNativeErrorMatrix(t *testing.T) {
 		{Bedrock, BedrockConfig{Region: "us-east-1", AccessKeyID: "a", SecretAccessKey: "s"}},
 		{Gemini, GeminiConfig{APIKey: "k"}},
 		{OpenAI, OpenAICompatConfig{APIKey: "k"}},
+		{OpenRouter, OpenAICompatConfig{APIKey: "k"}},
+		{Mistral, OpenAICompatConfig{APIKey: "k"}},
 	}
-	statuses := []int{400, 401, 403, 404, 413, 422, 429, 500, 502, 503, 529, 418}
-	body := `{"error":{"message":"maximum context length exceeded"}}`
 	for _, c := range cfgs {
-		for _, s := range statuses {
+		fake := newFake(resp(200, "{}"))
+		chat, _ := NewChat(c.id, c.cfg, WithHTTPClient(fake))
+		_, err := chat.Complete(context.Background(), ChatInput{Model: "m", Messages: []ChatMessage{{Role: "user", Content: "x"}}})
+		var ce *ConnectorError
+		if !errors.As(err, &ce) || ce.ProviderCode != CodeProviderUnavailable || ce.StatusCode == nil || *ce.StatusCode != 200 {
+			t.Fatalf("%s: expected provider_unavailable for 200 {}, got %v", c.id, err)
+		}
+	}
+	fake := newFake(resp(200, "{}"))
+	emb, _ := NewEmbeddings(OpenAI, OpenAICompatConfig{APIKey: "k"}, WithHTTPClient(fake))
+	_, err := emb.Create(context.Background(), EmbeddingsInput{Model: "m", Input: []string{"a"}})
+	var ce *ConnectorError
+	if !errors.As(err, &ce) || ce.ProviderCode != CodeProviderUnavailable {
+		t.Fatalf("embeddings: expected provider_unavailable for 200 {}, got %v", err)
+	}
+}
+
+// TestNativeErrorMatrix pins each connector's status→code classification for a
+// body whose message names no specific condition.
+func TestNativeErrorMatrix(t *testing.T) {
+	const (
+		inv  = CodeInvalidRequest
+		auth = CodeAuthFailed
+		rate = CodeRateLimited
+		prov = CodeProviderUnavailable
+		unk  = CodeUnknown
+	)
+	cfgs := []struct {
+		id   ProviderID
+		cfg  ChatConfig
+		want map[int]ProviderCode
+	}{
+		{Anthropic, AnthropicConfig{APIKey: "k"}, map[int]ProviderCode{402: rate, 408: prov, 424: inv}},
+		{Bedrock, BedrockConfig{Region: "us-east-1", AccessKeyID: "a", SecretAccessKey: "s"}, map[int]ProviderCode{402: rate, 408: prov, 424: prov}},
+		{Gemini, GeminiConfig{APIKey: "k"}, map[int]ProviderCode{402: rate, 408: prov, 424: inv}},
+		{OpenAI, OpenAICompatConfig{APIKey: "k"}, map[int]ProviderCode{402: rate, 408: prov, 424: inv}},
+	}
+	common := map[int]ProviderCode{400: inv, 401: auth, 403: auth, 404: inv, 413: inv, 422: inv, 429: rate,
+		500: prov, 502: prov, 503: prov, 504: prov, 529: prov, 418: inv, 409: inv, 451: inv, 302: unk}
+	body := `{"error":{"message":"request rejected"}}`
+	for _, c := range cfgs {
+		for s, want := range common {
+			if _, ok := c.want[s]; !ok {
+				c.want[s] = want
+			}
+		}
+		for s, want := range c.want {
 			fake := newFake(resp(s, body))
 			chat, _ := NewChat(c.id, c.cfg, WithHTTPClient(fake))
 			_, err := chat.Complete(context.Background(), ChatInput{Model: "m", Messages: []ChatMessage{{Role: "user", Content: "x"}}})
 			var ce *ConnectorError
-			if !errors.As(err, &ce) {
-				t.Fatalf("%s status %d: expected *ConnectorError, got %v", c.id, s, err)
-			}
-			if !valid[ce.ProviderCode] {
-				t.Fatalf("%s status %d: non-canonical code %q", c.id, s, ce.ProviderCode)
+			if !errors.As(err, &ce) || ce.ProviderCode != want || ce.StatusCode == nil || *ce.StatusCode != s {
+				t.Fatalf("%s status %d: got %v, want %s", c.id, s, err, want)
 			}
 		}
 	}
@@ -162,13 +202,16 @@ func TestEmbeddingsErrorMatrix(t *testing.T) {
 		CodeRateLimited: true, CodeAuthFailed: true, CodeProviderUnavailable: true,
 		CodeInvalidRequest: true, CodeUnknown: true,
 	}
-	for _, s := range []int{400, 401, 403, 404, 422, 429, 500, 418} {
+	want := map[int]ProviderCode{400: CodeInvalidRequest, 401: CodeAuthFailed, 402: CodeRateLimited, 403: CodeAuthFailed,
+		404: CodeInvalidRequest, 413: CodeInvalidRequest, 422: CodeInvalidRequest, 429: CodeRateLimited,
+		500: CodeProviderUnavailable, 418: CodeInvalidRequest, 408: CodeProviderUnavailable, 302: CodeUnknown}
+	for s, code := range want {
 		fake := newFake(resp(s, `{"error":{"message":"nope"}}`))
 		emb, _ := NewEmbeddings(OpenAI, OpenAICompatConfig{APIKey: "k"}, WithHTTPClient(fake))
 		_, err := emb.Create(context.Background(), EmbeddingsInput{Model: "m", Input: []string{"a"}})
 		var ce *ConnectorError
-		if !errors.As(err, &ce) || !valid[ce.ProviderCode] {
-			t.Fatalf("embeddings status %d: %v", s, err)
+		if !errors.As(err, &ce) || !valid[ce.ProviderCode] || ce.ProviderCode != code {
+			t.Fatalf("embeddings status %d: got %v, want %s", s, err, code)
 		}
 	}
 }

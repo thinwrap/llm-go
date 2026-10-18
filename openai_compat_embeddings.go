@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -36,7 +37,11 @@ func (c *openAICompatEmbeddingsConnector) create(ctx context.Context, in Embeddi
 		"encoding_format": "float",
 	}
 	if in.Dimensions != nil {
-		body["dimensions"] = *in.Dimensions
+		field := c.spec.embeddingsDimensionsField
+		if field == "" {
+			field = "dimensions"
+		}
+		body[field] = *in.Dimensions
 	}
 	applyBodyPassthrough(body, in.Passthrough)
 
@@ -49,19 +54,39 @@ func (c *openAICompatEmbeddingsConnector) create(ctx context.Context, in Embeddi
 	}
 	headers = mergeHeaders(headers, in.Passthrough)
 
-	resp, err := c.sendPostJSON(ctx, c.baseURL+"/embeddings", body, headers)
+	url := c.baseURL + "/embeddings"
+	if in.Passthrough != nil && len(in.Passthrough.Query) > 0 {
+		url += "?" + buildCanonicalQuery(in.Passthrough.Query)
+	}
+	resp, err := c.sendPostJSON(ctx, url, body, headers)
 	if err != nil {
 		return nil, err
 	}
-	raw := decodeAny(readBody(resp))
+	raw, readErr := readJSON(resp)
 	if !okStatus(resp.StatusCode) {
 		return nil, vendorError(resp.StatusCode, embeddingsMapCode(resp.StatusCode), extractErrorMessage(raw), raw, resp.Header)
+	}
+	if readErr != nil {
+		return nil, transportError(readErr)
 	}
 
 	if raw == nil {
 		return nil, emptyBodyError(resp.StatusCode)
 	}
-	rows, _ := jsonSliceVal(jsonGet(raw, "data"))
+	if errObj := jsonGet(raw, "error"); errObj != nil {
+		return nil, compatEmbeddedError(resp, errObj, raw, func(status int, _ any) ProviderCode { return embeddingsMapCode(status) })
+	}
+	rows, ok := jsonSliceVal(jsonGet(raw, "data"))
+	if !ok {
+		return nil, emptyBodyError(resp.StatusCode)
+	}
+	// Embeddings[i] must be the vector for Input[i]; a short/long data array or
+	// a null/non-numeric cell would silently misalign or corrupt vectors, so it
+	// is a failed call rather than a result.
+	if len(rows) != len(in.Input) {
+		return nil, malformedBodyError(resp.StatusCode,
+			"provider returned "+strconv.Itoa(len(rows))+" embeddings for "+strconv.Itoa(len(in.Input))+" inputs", raw)
+	}
 	sorted := make([]any, len(rows))
 	copy(sorted, rows)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -69,10 +94,19 @@ func (c *openAICompatEmbeddingsConnector) create(ctx context.Context, in Embeddi
 	})
 	embeddings := make([][]float64, 0, len(sorted))
 	for _, row := range sorted {
-		vecRaw, _ := jsonSliceVal(jsonGet(row, "embedding"))
+		vecRaw, ok := jsonSliceVal(jsonGet(row, "embedding"))
+		if !ok {
+			return nil, malformedBodyError(resp.StatusCode, "provider returned an embedding that is not a float array", raw)
+		}
 		vec := make([]float64, 0, len(vecRaw))
 		for _, f := range vecRaw {
-			vec = append(vec, jsonNum(f))
+			// encoding/json only yields finite float64s, so the type check alone
+			// rejects null and string cells.
+			n, ok := f.(float64)
+			if !ok {
+				return nil, malformedBodyError(resp.StatusCode, "provider returned a non-numeric embedding value", raw)
+			}
+			vec = append(vec, n)
 		}
 		embeddings = append(embeddings, vec)
 	}
@@ -95,11 +129,13 @@ func embeddingsMapCode(status int) ProviderCode {
 	switch {
 	case status == 401 || status == 403:
 		return CodeAuthFailed
-	case status == 429:
+	case status == 429 || status == 402:
 		return CodeRateLimited
-	case status >= 500:
+	// 408 is a transient timeout.
+	case status >= 500 || status == 408:
 		return CodeProviderUnavailable
-	case status == 400 || status == 404 || status == 422:
+	// 404, 413 (the batch is too large to send), 422, …: a request problem, as in chat.
+	case status >= 400:
 		return CodeInvalidRequest
 	}
 	return CodeUnknown

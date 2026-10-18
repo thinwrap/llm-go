@@ -8,11 +8,12 @@ import (
 	"errors"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-const bedrockModel = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+const bedrockModel = "anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 // authRe matches a well-formed SigV4 Authorization header for the bedrock service.
 var bedrockAuthRe = regexp.MustCompile(
@@ -65,11 +66,11 @@ func TestBedrockComplete(t *testing.T) {
 
 	// URL + path: colon in the model id must be percent-encoded and preserved on the wire.
 	wantURL := "https://bedrock-runtime.us-east-1.amazonaws.com/model/" +
-		"anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse"
+		"anthropic.claude-sonnet-4-5-20250929-v1%3A0/converse"
 	if req.URL.String() != wantURL {
 		t.Fatalf("bad url: %s", req.URL.String())
 	}
-	if req.URL.RequestURI() != "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse" {
+	if req.URL.RequestURI() != "/model/anthropic.claude-sonnet-4-5-20250929-v1%3A0/converse" {
 		t.Fatalf("bad wire path: %s", req.URL.RequestURI())
 	}
 
@@ -397,7 +398,7 @@ func TestBedrockCanonicalPathDoubleEncoded(t *testing.T) {
 	fake := newFake(resp(200, `{"output":{"message":{"content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1}}`))
 	chat, _ := NewChat(Bedrock, bedrockCfg(), WithHTTPClient(fake))
 	if _, err := chat.Complete(context.Background(), ChatInput{
-		Model:    bedrockModel, // "...-v2:0" — contains a ':'
+		Model:    bedrockModel, // "...-v1:0" — contains a ':'
 		Messages: []ChatMessage{{Role: "user", Content: "hi"}},
 	}); err != nil {
 		t.Fatal(err)
@@ -411,10 +412,10 @@ func TestBedrockCanonicalPathDoubleEncoded(t *testing.T) {
 	if got := req.URL.RequestURI(); got != singlePath {
 		t.Fatalf("wire path must be single-encoded\n got=%s\nwant=%s", got, singlePath)
 	}
-	if !strings.Contains(singlePath, "-v2%3A0/") || strings.Contains(singlePath, "%253A") {
+	if !strings.Contains(singlePath, "-v1%3A0/") || strings.Contains(singlePath, "%253A") {
 		t.Fatalf("singlePath should be single-encoded: %s", singlePath)
 	}
-	if !strings.Contains(doublePath, "-v2%253A0/") {
+	if !strings.Contains(doublePath, "-v1%253A0/") {
 		t.Fatalf("doublePath should be double-encoded (%%253A): %s", doublePath)
 	}
 	if singlePath == doublePath {
@@ -450,7 +451,7 @@ func TestBedrockCanonicalPathDoubleEncoded(t *testing.T) {
 func TestBedrockHeaderCasingDeterministicSignature(t *testing.T) {
 	fake := newFake(resp(200, `{"output":{"message":{"content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":1,"outputTokens":1}}`))
 	chat, _ := NewChat(Bedrock, bedrockCfg(), WithHTTPClient(fake))
-	model := "anthropic.claude-3-haiku" // no reserved chars → wire path == canonical path
+	model := "anthropic.claude-haiku-4-5" // no reserved chars → wire path == canonical path
 	if _, err := chat.Complete(context.Background(), ChatInput{
 		Model:       model,
 		Messages:    []ChatMessage{{Role: "user", Content: "hi"}},
@@ -482,5 +483,176 @@ func TestBedrockWrongConfig(t *testing.T) {
 	var ce *ConnectorError
 	if !errors.As(err, &ce) || ce.ProviderCode != CodeInvalidRequest {
 		t.Fatalf("expected invalid_request for wrong config type, got %v", err)
+	}
+}
+
+func TestBedrockRegionMustBeHostLabel(t *testing.T) {
+	// Region is spliced into the default host and the SigV4 scope; anything but
+	// one DNS label could send the signed request (session token included) to
+	// another host.
+	for _, region := range []string{"", "evil.example#", "x.evil.example/", "us-east-1.attacker", "US East", "us_east_1"} {
+		cfg := bedrockCfg()
+		cfg.Region = region
+		_, err := NewChat(Bedrock, cfg)
+		var ce *ConnectorError
+		if !errors.As(err, &ce) || ce.ProviderCode != CodeInvalidRequest {
+			t.Fatalf("region %q: expected invalid_request, got %v", region, err)
+		}
+	}
+	for _, region := range []string{"us-east-1", "eu-central-2", "us-gov-west-1", "ap-southeast-5"} {
+		cfg := bedrockCfg()
+		cfg.Region = region
+		if _, err := NewChat(Bedrock, cfg); err != nil {
+			t.Fatalf("region %q rejected: %v", region, err)
+		}
+	}
+}
+
+func TestBedrockToolChoiceNone(t *testing.T) {
+	// Converse has no "none" choice, so the tools are left out entirely, with or
+	// without tool blocks in the history; sending them would let the model call one.
+	tools := []ToolDefinition{{Name: "lookup", Parameters: map[string]any{"type": "object"}}}
+	okBody := `{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn"}`
+	histories := [][]ChatMessage{
+		{{Role: "user", Content: "hi"}},
+		{
+			{Role: "user", Content: "hi"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "tu_1", Name: "lookup", Arguments: `{}`}}},
+			{Role: "tool", ToolCallID: "tu_1", Content: "42"},
+		},
+	}
+	for i, msgs := range histories {
+		fake := newFake(resp(200, okBody))
+		chat, _ := NewChat(Bedrock, bedrockCfg(), WithHTTPClient(fake))
+		if _, err := chat.Complete(context.Background(), ChatInput{Model: bedrockModel, Messages: msgs,
+			Tools: tools, ToolChoice: &ToolChoice{Mode: "none"}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := sentBody(t, fake)["toolConfig"]; ok {
+			t.Fatalf("history %d: toolChoice none must omit toolConfig: %s", i, fake.last().Body)
+		}
+	}
+}
+
+func TestBedrockStreamRequiresStopReason(t *testing.T) {
+	body := `{"output":{"message":{"role":"assistant","content":[{"text":"Partial"}]}},"usage":{"inputTokens":1,"outputTokens":1}}`
+	chat, _ := NewChat(Bedrock, bedrockCfg(), WithHTTPClient(newFake(resp(200, body))))
+	_, err := chat.Stream(context.Background(), ChatInput{Model: bedrockModel, Messages: []ChatMessage{{Role: "user", Content: "hi"}}})
+	var ce *ConnectorError
+	if !errors.As(err, &ce) || ce.ProviderCode != CodeProviderUnavailable || ce.StatusCode != nil {
+		t.Fatalf("expected provider_unavailable for a stream without stopReason, got %v", err)
+	}
+}
+
+func TestBedrockUsageIncludesCache(t *testing.T) {
+	body := `{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn",` +
+		`"usage":{"inputTokens":12,"outputTokens":30,"totalTokens":42,"cacheReadInputTokens":1000,"cacheWriteInputTokens":200}}`
+	chat, _ := NewChat(Bedrock, bedrockCfg(), WithHTTPClient(newFake(resp(200, body))))
+	res, err := chat.Complete(context.Background(), ChatInput{Model: bedrockModel, Messages: []ChatMessage{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Usage != (Usage{InputTokens: 1212, OutputTokens: 30, TotalTokens: 1242}) {
+		t.Fatalf("usage: %+v", res.Usage)
+	}
+}
+
+func TestBedrockErrorClassification(t *testing.T) {
+	cases := []struct {
+		status int
+		typ    string
+		msg    string
+		want   ProviderCode
+	}{
+		{400, "ValidationException", "Input is too long for requested model.", CodeContextLengthExceeded},
+		{400, "ValidationException", "The model returned the following errors: prompt is too long: 210000 tokens > 200000 maximum", CodeContextLengthExceeded},
+		// Ordinary validation errors that mention tokens / max.
+		{400, "ValidationException", "The maximum tokens you requested exceeds the model limit of 64000.", CodeInvalidRequest},
+		{400, "ValidationException", "1 validation error detected: Value at 'inferenceConfig.maxTokens' failed to satisfy constraint", CodeInvalidRequest},
+		{408, "ModelTimeoutException", "Model has timed out in processing the request.", CodeProviderUnavailable},
+		{424, "ModelErrorException", "The model returned an error.", CodeProviderUnavailable},
+		{429, "ThrottlingException", "Too many requests, please wait before trying again.", CodeRateLimited},
+		{413, "", "Request entity too large", CodeInvalidRequest},
+	}
+	for _, c := range cases {
+		body := `{"message":` + strconv.Quote(c.msg) + `}`
+		chat, _ := NewChat(Bedrock, bedrockCfg(), WithHTTPClient(newFake(respH(c.status, body, "X-Amzn-Errortype", c.typ))))
+		_, err := chat.Complete(context.Background(), ChatInput{Model: bedrockModel, Messages: []ChatMessage{{Role: "user", Content: "x"}}})
+		var ce *ConnectorError
+		if !errors.As(err, &ce) || ce.ProviderCode != c.want {
+			t.Fatalf("%d %q: got %v, want %s", c.status, c.msg, err, c.want)
+		}
+	}
+}
+
+func TestBedrockStopReasonMapping(t *testing.T) {
+	for sr, want := range map[string]FinishReason{
+		"end_turn": "stop", "max_tokens": "length", "model_context_window_exceeded": "length", "tool_use": "tool_calls",
+		"guardrail_intervened": "content_filter", "malformed_tool_use": "unknown", "malformed_model_output": "unknown",
+	} {
+		if got := bedrockMapStopReason(sr); got != want {
+			t.Fatalf("%s → %s, want %s", sr, got, want)
+		}
+	}
+}
+
+func TestBedrockTotalIsInputPlusOutput(t *testing.T) {
+	// The vendor total may or may not cover cache tokens; the normalized total is
+	// always input (cache included) + output.
+	body := `{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn",` +
+		`"usage":{"inputTokens":12,"outputTokens":30,"totalTokens":9999,"cacheReadInputTokens":100}}`
+	chat, _ := NewChat(Bedrock, bedrockCfg(), WithHTTPClient(newFake(resp(200, body))))
+	res, err := chat.Complete(context.Background(), ChatInput{Model: bedrockModel, Messages: []ChatMessage{{Role: "user", Content: "hi"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Usage != (Usage{InputTokens: 112, OutputTokens: 30, TotalTokens: 142}) {
+		t.Fatalf("usage: %+v", res.Usage)
+	}
+}
+
+func TestBedrockBaseURLPathPrefixSigned(t *testing.T) {
+	// A gateway mount point in BaseURL is on the wire, so it must be signed too.
+	fake := newFake(resp(200, `{"output":{"message":{"content":[{"text":"ok"}]}},"stopReason":"end_turn"}`))
+	cfg := bedrockCfg()
+	cfg.BaseURL = "https://gateway.example.com/proxy/bedrock/"
+	chat, _ := NewChat(Bedrock, cfg, WithHTTPClient(fake))
+	if _, err := chat.Complete(context.Background(), ChatInput{Model: bedrockModel, Messages: []ChatMessage{{Role: "user", Content: "hi"}}}); err != nil {
+		t.Fatal(err)
+	}
+	req := fake.last()
+	wantWire := "/proxy/bedrock/model/anthropic.claude-sonnet-4-5-20250929-v1%3A0/converse"
+	if req.URL.RequestURI() != wantWire {
+		t.Fatalf("wire path: %s", req.URL.RequestURI())
+	}
+	m := bedrockAuthRe.FindStringSubmatch(req.Header.Get("Authorization"))
+	if m == nil {
+		t.Fatalf("bad Authorization: %s", req.Header.Get("Authorization"))
+	}
+	want := recomputeBedrockSig(req, "secret/key+x", "/proxy/bedrock/model/anthropic.claude-sonnet-4-5-20250929-v1%253A0/converse")
+	if m[2] != want {
+		t.Fatalf("signature must cover the path prefix\n got=%s\nwant=%s", m[2], want)
+	}
+}
+
+func TestBedrockReview5ErrorRules(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		msg    string
+		want   ProviderCode
+	}{
+		{402, "Payment required", CodeRateLimited},
+		{400, "The model returned the following errors: This model's maximum context length is 8192 tokens.", CodeContextLengthExceeded},
+		{400, "input length and `max_tokens` exceed context limit: 195000 + 8192 > 200000", CodeContextLengthExceeded},
+		{400, "The requested thinking budget exceeds the context window.", CodeInvalidRequest},
+		{409, "ConflictException", CodeInvalidRequest},
+	} {
+		body := `{"message":` + strconv.Quote(c.msg) + `}`
+		chat, _ := NewChat(Bedrock, bedrockCfg(), WithHTTPClient(newFake(resp(c.status, body))))
+		_, err := chat.Complete(context.Background(), ChatInput{Model: bedrockModel, Messages: []ChatMessage{{Role: "user", Content: "x"}}})
+		var ce *ConnectorError
+		if !errors.As(err, &ce) || ce.ProviderCode != c.want {
+			t.Fatalf("%d %q: got %v, want %s", c.status, c.msg, err, c.want)
+		}
 	}
 }

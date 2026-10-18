@@ -13,6 +13,8 @@ type openAICompatSpec struct {
 	supportsTools *bool
 	// maxTokensField overrides the default "max_tokens".
 	maxTokensField string
+	// embeddingsDimensionsField overrides the default embeddings "dimensions".
+	embeddingsDimensionsField string
 	// streamUsagePath == "x_groq" relocates streaming usage under x_groq.usage (Groq).
 	streamUsagePath string
 	// strictParams skips OpenAI-only extras like stream_options (Mistral 422s on unknown params).
@@ -29,8 +31,11 @@ func bearer(cfg OpenAICompatConfig) map[string]string {
 func boolPtr(b bool) *bool { return &b }
 
 var specs = map[ProviderID]openAICompatSpec{
-	OpenAI: {id: OpenAI, defaultBaseURL: "https://api.openai.com/v1", buildAuthHeaders: bearer},
-	AzureOpenAI: {id: AzureOpenAI, buildAuthHeaders: func(cfg OpenAICompatConfig) map[string]string {
+	// OpenAI deprecated max_tokens in favor of max_completion_tokens (o-series
+	// models reject max_tokens), and Azure's reasoning models accept only
+	// max_completion_tokens on Chat Completions.
+	OpenAI: {id: OpenAI, defaultBaseURL: "https://api.openai.com/v1", buildAuthHeaders: bearer, maxTokensField: "max_completion_tokens"},
+	AzureOpenAI: {id: AzureOpenAI, maxTokensField: "max_completion_tokens", buildAuthHeaders: func(cfg OpenAICompatConfig) map[string]string {
 		if cfg.APIKey == "" {
 			return map[string]string{}
 		}
@@ -42,7 +47,8 @@ var specs = map[ProviderID]openAICompatSpec{
 	Fireworks:  {id: Fireworks, defaultBaseURL: "https://api.fireworks.ai/inference/v1", buildAuthHeaders: bearer},
 	DeepSeek:   {id: DeepSeek, defaultBaseURL: "https://api.deepseek.com/v1", buildAuthHeaders: bearer},
 	XAI:        {id: XAI, defaultBaseURL: "https://api.x.ai/v1", buildAuthHeaders: bearer},
-	Mistral:    {id: Mistral, defaultBaseURL: "https://api.mistral.ai/v1", buildAuthHeaders: bearer, strictParams: true},
+	// Mistral names the embeddings output size output_dimension.
+	Mistral:    {id: Mistral, defaultBaseURL: "https://api.mistral.ai/v1", buildAuthHeaders: bearer, strictParams: true, embeddingsDimensionsField: "output_dimension"},
 	Perplexity: {id: Perplexity, defaultBaseURL: "https://api.perplexity.ai", buildAuthHeaders: bearer, supportsTools: boolPtr(false)},
 	DeepInfra:  {id: DeepInfra, defaultBaseURL: "https://api.deepinfra.com/v1/openai", buildAuthHeaders: bearer},
 	Cloudflare: {id: Cloudflare, buildAuthHeaders: bearer},

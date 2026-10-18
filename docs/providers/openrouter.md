@@ -57,6 +57,8 @@ out, err := emb.Create(ctx, llm.EmbeddingsInput{Model: "openai/text-embedding-3-
 
 ## Error mapping & passthrough
 
-- Non-2xx returns a `*llm.ConnectorError` with `ProviderCode` in `rate_limited` / `auth_failed` / `provider_unavailable` / `invalid_request` / `context_length_exceeded` / `content_filtered` / `unknown`.
+- A 200 whose body carries an `error` object (no `choices`), or whose `choices[0]` has `finish_reason: "error"` / an `error`, also returns a `*llm.ConnectorError`. `StatusCode` is the status the response arrived with (the 2xx). `ProviderCode` comes from the embedded error: an integer (or numeric-string) `error.code` 400–599 is classified as if it were that HTTP status, a named code or type (`insufficient_quota`, `invalid_api_key`, `server_error`, …) by the same rules, and an error with no usable code is `unknown`.
+- Non-2xx returns a `*llm.ConnectorError` with `ProviderCode` in `rate_limited` / `auth_failed` / `provider_unavailable` / `invalid_request` / `context_length_exceeded` / `content_filtered` / `unknown`. `402` (insufficient credits) is `rate_limited`.
+- A mid-stream error chunk (a top-level `error`, or `finish_reason: "error"`) ends the stream with a `*llm.ConnectorError` the same way: the stream's own status (normally 200), classified by `error.code` / `type`, `unknown` without one.
 - `Retry-After` rides on `Cause["retryAfter"]` / `Cause["retryAfterSeconds"]`; raw body on `Cause["raw"]`.
 - Provider-routing controls + sub-baseline fields go via `Passthrough.Body` / `.Headers` / `.Query`; response extras on `ChatResult.Raw`.

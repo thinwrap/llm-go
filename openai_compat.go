@@ -2,7 +2,9 @@ package llm
 
 import (
 	"context"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -38,13 +40,28 @@ func (c *openAICompatConnector) complete(ctx context.Context, in ChatInput) (*Ch
 	if err != nil {
 		return nil, err
 	}
-	data := readBody(resp)
-	raw := decodeAny(data)
+	raw, readErr := readJSON(resp)
 	if !okStatus(resp.StatusCode) {
 		return nil, compatVendorError(resp, raw)
 	}
+	if readErr != nil {
+		return nil, transportError(readErr)
+	}
 	if raw == nil {
 		return nil, emptyBodyError(resp.StatusCode)
+	}
+	// OpenRouter reports failures after processing started as HTTP 200 with
+	// either only an `error` object or choices[0].finish_reason "error" plus a
+	// choices[0].error — without these checks they parse as an empty success.
+	if errObj := jsonGet(raw, "error"); errObj != nil {
+		return nil, compatEmbeddedError(resp, errObj, raw, compatMapCode)
+	}
+	choices, _ := jsonSliceVal(jsonGet(raw, "choices"))
+	if len(choices) == 0 {
+		return nil, emptyBodyError(resp.StatusCode)
+	}
+	if errObj := jsonGet(choices[0], "error"); errObj != nil || jsonStr(jsonGet(choices[0], "finish_reason")) == "error" {
+		return nil, compatEmbeddedError(resp, errObj, raw, compatMapCode)
 	}
 	return c.parseResult(raw, in.Model), nil
 }
@@ -57,12 +74,18 @@ func (c *openAICompatConnector) stream(ctx context.Context, in ChatInput) (*Chat
 		return nil, err
 	}
 	if !okStatus(resp.StatusCode) {
-		raw := decodeAny(readBody(resp))
+		raw, _ := readJSON(resp)
 		return nil, compatVendorError(resp, raw)
 	}
+	if err := requireEventStream(resp); err != nil {
+		return nil, err
+	}
+	// A complete stream ends on [DONE], and its last choice chunk carries a
+	// finish_reason; either proves the answer was not cut off.
+	status := resp.StatusCode
 	return newChatStream(resp, func(chunk any) ([]*ChatStreamDelta, error) {
-		return c.mapStreamChunk(chunk)
-	}), nil
+		return c.mapStreamChunk(chunk, status)
+	}, nil), nil
 }
 
 func (c *openAICompatConnector) buildRequest(in ChatInput, stream bool) (string, map[string]any, map[string]string) {
@@ -113,7 +136,8 @@ func (c *openAICompatConnector) buildRequest(in ChatInput, stream bool) (string,
 			body["stop"] = in.Stop
 		}
 	}
-	if in.Reasoning != nil {
+	// An empty effort is left to the provider's default; "" itself is rejected.
+	if in.Reasoning != nil && in.Reasoning.Effort != "" {
 		body["reasoning_effort"] = in.Reasoning.Effort
 	}
 	if stream {
@@ -148,7 +172,7 @@ func (c *openAICompatConnector) parseResult(raw any, requestedModel string) *Cha
 	}
 	msg := jsonGet(choice, "message")
 	res := &ChatResult{
-		Message:      AssistantMessage{Role: "assistant", Content: jsonStr(jsonGet(msg, "content"))},
+		Message:      AssistantMessage{Role: "assistant", Content: compatContentText(jsonGet(msg, "content"))},
 		FinishReason: compatFinishReason(jsonStr(jsonGet(choice, "finish_reason"))),
 		Usage:        compatUsage(jsonGet(raw, "usage")),
 		Model:        firstStr(jsonStr(jsonGet(raw, "model")), requestedModel),
@@ -162,11 +186,13 @@ func (c *openAICompatConnector) parseResult(raw any, requestedModel string) *Cha
 	return res
 }
 
-func (c *openAICompatConnector) mapStreamChunk(chunk any) ([]*ChatStreamDelta, error) {
-	// A mid-stream {"error":{...}} frame must abort with a *ConnectorError rather
-	// than be silently dropped (which would truncate the result cleanly).
-	if jsonGet(chunk, "error") != nil {
-		return nil, streamFrameError(CodeProviderUnavailable, extractErrorMessage(chunk), chunk)
+func (c *openAICompatConnector) mapStreamChunk(chunk any, status int) ([]*ChatStreamDelta, error) {
+	// A mid-stream error (OpenRouter: a top-level `error`, and/or a choice with
+	// finish_reason "error") must abort with a *ConnectorError rather than be
+	// silently dropped, which would truncate the result cleanly.
+	if errObj, failed := compatStreamError(chunk); failed {
+		msg := extractErrorMessage(map[string]any{"error": errObj})
+		return nil, streamFrameError(status, compatEmbeddedCode(errObj, compatMapCode), msg, chunk)
 	}
 
 	choices, _ := jsonSliceVal(jsonGet(chunk, "choices"))
@@ -177,7 +203,7 @@ func (c *openAICompatConnector) mapStreamChunk(chunk any) ([]*ChatStreamDelta, e
 	delta := jsonGet(choice, "delta")
 
 	var out []*ChatStreamDelta
-	if s := jsonStr(jsonGet(delta, "content")); s != "" {
+	if s := compatContentText(jsonGet(delta, "content")); s != "" {
 		out = append(out, &ChatStreamDelta{ContentDelta: s, Raw: chunk})
 	}
 	// Emit one delta per tool-call entry: a single chunk may carry several.
@@ -222,6 +248,85 @@ func (c *openAICompatConnector) mapStreamChunk(chunk any) ([]*ChatStreamDelta, e
 func compatVendorError(resp *http.Response, raw any) *ConnectorError {
 	msg := extractErrorMessage(raw)
 	return vendorError(resp.StatusCode, compatMapCode(resp.StatusCode, raw), msg, raw, resp.Header)
+}
+
+// compatEmbeddedError maps an error object found inside a 2xx body
+// (OpenRouter's mid-generation failures, an embeddings error). Like every
+// in-body error it keeps the HTTP status it arrived with; the classification
+// comes from the embedded error.code / type (OpenRouter puts the upstream HTTP
+// status in error.code), and an error with neither is unknown.
+func compatEmbeddedError(resp *http.Response, errObj, raw any, mapCode func(int, any) ProviderCode) *ConnectorError {
+	wrapped := map[string]any{"error": errObj}
+	msg := extractErrorMessage(wrapped)
+	if msg == "" {
+		msg = "provider returned an error inside a successful response"
+	}
+	return vendorError(resp.StatusCode, compatEmbeddedCode(errObj, mapCode), msg, raw, resp.Header)
+}
+
+// compatErrorStatus reads an HTTP status out of an embedded error.code, which
+// OpenRouter fills with the upstream status.
+func compatErrorStatus(errObj any) (int, bool) {
+	n, ok := jsonGet(errObj, "code").(float64)
+	if s, isStr := jsonGet(errObj, "code").(string); isStr && len(s) == 3 {
+		if v, err := strconv.Atoi(s); err == nil {
+			n, ok = float64(v), true
+		}
+	}
+	if !ok || n != math.Trunc(n) || n < 400 || n > 599 {
+		return 0, false
+	}
+	return int(n), true
+}
+
+// compatErrorNames maps the OpenAI-style error code / type names an embedded
+// error can carry instead of a number to the HTTP status they stand for.
+var compatErrorNames = map[string]int{
+	"invalid_request_error": 400, "context_length_exceeded": 400,
+	"authentication_error": 401, "invalid_api_key": 401, "permission_error": 403,
+	"not_found_error": 404, "rate_limit_error": 429, "rate_limit_exceeded": 429,
+	"insufficient_quota": 429, "server_error": 500, "api_error": 500, "overloaded_error": 529,
+}
+
+// compatErrorNameStatus resolves an embedded error's code, then its type, by name.
+func compatErrorNameStatus(errObj any) (int, bool) {
+	for _, k := range []string{"code", "type"} {
+		if n, ok := compatErrorNames[jsonStr(jsonGet(errObj, k))]; ok {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// compatEmbeddedCode classifies an in-body or mid-stream error by its
+// status-like or named code; an error with neither is unknown.
+func compatEmbeddedCode(errObj any, mapCode func(int, any) ProviderCode) ProviderCode {
+	wrapped := map[string]any{"error": errObj}
+	if n, ok := compatErrorStatus(errObj); ok {
+		return mapCode(n, wrapped)
+	}
+	if n, ok := compatErrorNameStatus(errObj); ok {
+		return mapCode(n, wrapped)
+	}
+	return CodeUnknown
+}
+
+// compatStreamError finds a mid-stream failure in a chunk: a top-level error
+// object, or choices[0] carrying an error or finish_reason "error".
+func compatStreamError(chunk any) (any, bool) {
+	if e := jsonGet(chunk, "error"); e != nil {
+		return e, true
+	}
+	choices, _ := jsonSliceVal(jsonGet(chunk, "choices"))
+	if len(choices) > 0 {
+		if e := jsonGet(choices[0], "error"); e != nil {
+			return e, true
+		}
+		if jsonStr(jsonGet(choices[0], "finish_reason")) == "error" {
+			return nil, true
+		}
+	}
+	return nil, false
 }
 
 // ---- module-private mappers ----
@@ -269,6 +374,24 @@ func compatContent(m ChatMessage) any {
 		return nil
 	}
 	return ""
+}
+
+// compatContentText reads message.content / delta.content. Mistral reasoning
+// models return a list of chunks instead of a string — ThinkChunk
+// {"type":"thinking",...} and TextChunk {"type":"text","text":...} — so only the
+// text chunks are the answer; thinking stays visible on Raw.
+func compatContentText(v any) string {
+	parts, ok := jsonSliceVal(v)
+	if !ok {
+		return jsonStr(v)
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		if jsonStr(jsonGet(p, "type")) == "text" {
+			b.WriteString(jsonStr(jsonGet(p, "text")))
+		}
+	}
+	return b.String()
 }
 
 func compatToolCall(tc any) ToolCall {
@@ -324,19 +447,24 @@ func compatMapCode(status int, body any) ProviderCode {
 	switch {
 	case status == 401 || status == 403:
 		return CodeAuthFailed
-	case status == 429:
+	// 402 is out of credits (OpenRouter: "insufficient credits"), grouped with
+	// the quota 429 because the call cannot succeed until the account is topped up.
+	case status == 429 || status == 402:
 		return CodeRateLimited
-	case status >= 500:
+	// 408 is a transient timeout.
+	case status >= 500 || status == 408:
 		return CodeProviderUnavailable
 	}
-	if status == 400 || status == 404 || status == 413 || status == 422 {
-		// 413 (Payload Too Large) is a client-side request problem — a too-big
-		// prompt/body — not an opaque failure; it must not fall through to Unknown.
+	if status >= 400 && status < 500 {
+		// 404, 413 (a too-big prompt/body), 422, …: the request cannot succeed
+		// as sent, unless the body names a more specific cause.
 		msg := strings.ToLower(extractErrorMessage(body))
-		if strings.Contains(msg, "context length") || strings.Contains(msg, "maximum context") || strings.Contains(msg, "context_length") {
+		if jsonStr(jsonGet(jsonGet(body, "error"), "code")) == "context_length_exceeded" ||
+			strings.Contains(msg, "context length") || strings.Contains(msg, "maximum context") || strings.Contains(msg, "context_length") {
 			return CodeContextLengthExceeded
 		}
-		if strings.Contains(msg, "content") && strings.Contains(msg, "filter") {
+		if (strings.Contains(msg, "content") && strings.Contains(msg, "filter")) ||
+			strings.Contains(msg, "content_policy") || strings.Contains(msg, "content policy") || strings.Contains(msg, "moderation") {
 			return CodeContentFiltered
 		}
 		return CodeInvalidRequest

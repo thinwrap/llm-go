@@ -69,14 +69,22 @@ func transportError(err error) *ConnectorError {
 }
 
 // emptyBodyError is returned when a 2xx response carries no decodable JSON body
-// (a proxy/captive-portal HTML page, or a truncated/aborted read that readBody
-// surfaced as nil). Without this guard the connector would parse nil into an
-// empty "successful" result — silent data loss indistinguishable from a real
-// empty completion.
+// (a proxy/captive-portal HTML page), or JSON without the payload the wire
+// contract requires (e.g. `{}`). Without this guard the connector would parse
+// it into an empty "successful" result — silent data loss indistinguishable
+// from a real empty completion.
 func emptyBodyError(status int) *ConnectorError {
 	s := status
-	msg := "provider returned a successful status with an empty or non-JSON body"
+	msg := "provider returned a successful status with an empty, non-JSON, or payload-less body"
 	return &ConnectorError{StatusCode: &s, ProviderCode: CodeProviderUnavailable, Message: msg, ProviderMessage: msg}
+}
+
+// malformedBodyError is returned when a 2xx body decodes as JSON but violates
+// the response contract in a way that would otherwise yield a silently wrong
+// result. The decoded body rides in Cause["raw"] for diagnosis.
+func malformedBodyError(status int, msg string, raw any) *ConnectorError {
+	s := status
+	return &ConnectorError{StatusCode: &s, ProviderCode: CodeProviderUnavailable, Message: msg, ProviderMessage: msg, Cause: map[string]any{"raw": raw}}
 }
 
 // sanitizeCause redacts credentials embedded in a transport error before it is
@@ -93,16 +101,19 @@ func sanitizeCause(err error) error {
 }
 
 // streamFrameError builds a *ConnectorError from a decoded mid-stream vendor
-// error frame. SSE error frames carry no HTTP status, so StatusCode stays nil and
-// the decoded frame rides in Cause["raw"] — matching the non-stream error shape.
-func streamFrameError(code ProviderCode, message string, raw any) *ConnectorError {
+// error frame. Like every in-body error, it carries the HTTP status the stream
+// arrived with (normally 200), not one guessed from the frame; the
+// classification comes from the frame's own type or code, and the decoded
+// frame rides in Cause["raw"] — matching the non-stream error shape.
+func streamFrameError(status int, code ProviderCode, message string, raw any) *ConnectorError {
 	if message == "" {
 		message = "provider returned an error mid-stream"
 	}
 	if code == "" {
-		code = CodeProviderUnavailable
+		code = CodeUnknown
 	}
-	return &ConnectorError{ProviderCode: code, ProviderMessage: message, Message: message, Cause: map[string]any{"raw": raw}}
+	s := status
+	return &ConnectorError{StatusCode: &s, ProviderCode: code, ProviderMessage: message, Message: message, Cause: map[string]any{"raw": raw}}
 }
 
 // vendorError builds a *ConnectorError for a non-2xx HTTP response. The
@@ -132,12 +143,16 @@ func parseRetryAfter(v string) (int, bool) {
 	if s == "" {
 		return 0, false
 	}
-	if secs, err := strconv.Atoi(s); err == nil {
-		if secs < 0 {
-			return 0, false
+	// delay-seconds is 1*DIGIT (RFC 9110); a sign or a fraction makes the
+	// value invalid, so it is ignored rather than rounded or guessed.
+	if strings.Trim(s, "0123456789") == "" {
+		if secs, err := strconv.Atoi(s); err == nil {
+			return secs, true
 		}
-		return secs, true
+		return 0, false
 	}
+	// http.ParseTime accepts exactly RFC 9110's three HTTP-date formats
+	// (IMF-fixdate, RFC 850, asctime). A past date means retry now.
 	if t, err := http.ParseTime(s); err == nil {
 		delta := int(time.Until(t).Round(time.Second) / time.Second)
 		if delta < 0 {

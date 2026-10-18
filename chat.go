@@ -1,6 +1,9 @@
 package llm
 
-import "context"
+import (
+	"context"
+	"strconv"
+)
 
 // ---- normalized chat types (identical surface across every provider) ----
 
@@ -30,6 +33,10 @@ type ToolCall struct {
 	Name string
 	// Arguments is a JSON-encoded arguments string.
 	Arguments string
+	// ProviderMetadata is opaque per-call vendor state keyed by provider id
+	// (Gemini's "gemini" thoughtSignature). Copy it back unchanged on the next
+	// request's assistant turn; a connector reads only its own key.
+	ProviderMetadata map[string]any
 }
 
 // ChatMessage is one turn. Use Content for plain text, or ContentParts for
@@ -44,6 +51,11 @@ type ChatMessage struct {
 	ToolCallID string
 	// Name is an optional author / tool name.
 	Name string
+	// ProviderMetadata is opaque per-turn vendor state keyed by provider id
+	// (Anthropic's "anthropic" content blocks, thinking included). Copy it from
+	// ChatResult.Message along with Content and ToolCalls; a connector reads
+	// only its own key, so a history survives a provider switch.
+	ProviderMetadata map[string]any
 }
 
 // ToolDefinition describes a callable function (type is implicitly "function").
@@ -105,6 +117,9 @@ type AssistantMessage struct {
 	Role      ChatRole
 	Content   string
 	ToolCalls []ToolCall
+	// ProviderMetadata is the opaque per-turn vendor state to copy onto the
+	// ChatMessage that replays this turn (see ChatMessage.ProviderMetadata).
+	ProviderMetadata map[string]any
 }
 
 // ChatResult is the normalized non-streaming completion.
@@ -124,6 +139,8 @@ type ToolCallDelta struct {
 	ID             string
 	FunctionName   string
 	ArgumentsDelta string
+	// ProviderMetadata is the opaque per-call vendor state for ToolCall.ProviderMetadata.
+	ProviderMetadata map[string]any
 }
 
 // ChatStreamDelta is one incremental streaming chunk.
@@ -131,8 +148,13 @@ type ChatStreamDelta struct {
 	ContentDelta  string
 	ToolCallDelta *ToolCallDelta
 	FinishReason  FinishReason
-	Usage         *Usage
-	Raw           any
+	// Usage is cumulative for the whole call; when several deltas carry it,
+	// the last one wins (never sum them).
+	Usage *Usage
+	// ProviderMetadata, set on the terminal delta, is the opaque per-turn vendor
+	// state for the assistant ChatMessage that replays this turn.
+	ProviderMetadata map[string]any
+	Raw              any
 }
 
 // ---- dispatch ----
@@ -193,13 +215,35 @@ func (c *Chat) ProviderID() ProviderID { return c.id }
 
 // Complete performs a non-streaming chat completion.
 func (c *Chat) Complete(ctx context.Context, in ChatInput) (*ChatResult, error) {
+	if err := validateContentParts(in.Messages); err != nil {
+		return nil, err
+	}
 	return c.connector.complete(ctx, in)
 }
 
 // Stream performs a streaming chat completion. Read deltas from the returned
 // *ChatStream with Recv until it returns io.EOF, then Close it.
 func (c *Chat) Stream(ctx context.Context, in ChatInput) (*ChatStream, error) {
+	if err := validateContentParts(in.Messages); err != nil {
+		return nil, err
+	}
 	return c.connector.stream(ctx, in)
+}
+
+// validateContentParts rejects a ContentPart whose Type is neither "text" nor
+// "image". Every connector maps a non-text part as an image, so a zero-value or
+// misspelled Type would otherwise go out as an empty image the vendor rejects
+// with an opaque error.
+func validateContentParts(msgs []ChatMessage) error {
+	for i, m := range msgs {
+		for _, p := range m.ContentParts {
+			if p.Type != "text" && p.Type != "image" {
+				return invalidReq("messages[" + strconv.Itoa(i) + "]: unsupported ContentPart.Type " +
+					strconv.Quote(p.Type) + ` (want "text" or "image")`)
+			}
+		}
+	}
+	return nil
 }
 
 // ChatStream is a pull-based stream of ChatStreamDelta. Recv returns io.EOF when
